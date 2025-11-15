@@ -11,37 +11,37 @@ app = FastAPI(title="Balance MCP Tool")
 
 
 class BalanceRequest(BaseModel):
-    user_id: str
-    params: dict
+    account_number: str
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class BalanceResponse(BaseModel):
-    success: bool
-    balance: Optional[float] = None
-    account_id: Optional[str] = None
-    currency: str = "INR"
-    error: Optional[str] = None
+    account_number: str
+    balance: float
+    available_balance: Optional[float] = None
+    currency: str
+    status: str
 
 
-@app.post("/execute", response_model=BalanceResponse)
-async def get_balance(request: BalanceRequest):
+# -----------------------
+# Tools endpoints
+# -----------------------
+
+@app.post("/tools/balance", response_model=BalanceResponse, dependencies=[Depends(verify_mcp_key)])
+async def tool_balance(req: BalanceRequest):
     """
-    Get account balance for user
+    Return account balance for a given account_number.
+    Orchestrator should call this to fetch latest balance before confirming high-risk actions.
     """
-    try:
-        # TODO: Call mock-bank API
-        # For now, return mock data
-        return BalanceResponse(
-            success=True,
-            balance=50000.00,
-            account_id="ACC001",
-            currency="INR"
-        )
-    except Exception as e:
-        return BalanceResponse(success=False, error=str(e))
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+    # Query mock bank account endpoint
+    data = await call_mock_bank("GET", f"/api/accounts/{req.account_number}")
+    # data expected to match AccountOut serialization
+    return BalanceResponse(
+        account_number=req.account_number,
+        balance=float(data.get("balance", 0.0)),
+        available_balance=float(data.get("available_balance")) if data.get("available_balance") is not None else None,
+        currency=data.get("currency", "USD"),
+        status=data.get("status", "unknown")
+    )
 
