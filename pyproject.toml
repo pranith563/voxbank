@@ -1,0 +1,27 @@
+[project]
+name = "voxbank-orchestrator"
+version = "0.1.0"
+description = "Orchestrator service for VoxBank voice banking assistant"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-dotenv",
+    "httpx",
+    "google-genai", # Gemini SDK (async)
+    "pydantic",
+    "pydantic-settings",
+    "orjson", # Faster JSON (FastAPI default recommended)
+    "aiofiles", # Needed for FastAPI static or file ops
+    "fastapi-cli", # Optional – convenient commands
+    "psycopg[binary]", # <— Postgres driver
+    "alembic",
+    "sqlalchemy",
+    "psycopg2>=2.9.11",
+    "asyncpg>=0.30.0",
+]
+
+[tool.uv]
+# Recommended UV settings
+index-url = "https://pypi.org/simple"
