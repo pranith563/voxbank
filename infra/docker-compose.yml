@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # Orchestrator - Main LLM orchestration service
+  orchestrator:
+    build: ./orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - MCP_TOOLS_BASE_URL=http://mcp-balance:8002
+      - MOCK_BANK_URL=http://mock-bank:8001
+      - AUTH_SERVICE_URL=http://auth-service:8004
+    depends_on:
+      - mock-bank
+      - mcp-balance
+      - auth-service
+    networks:
+      - voxbank-network
+
+  # Mock Bank Backend
+  mock-bank:
+    build: ./mock-bank
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./mock-bank/db.json:/app/db.json
+    networks:
+      - voxbank-network
+
+  # MCP Tool Services
+  mcp-balance:
+    build: ./mcp-tools/balance
+    ports:
+      - "8002:8002"
+    environment:
+      - BANK_API_URL=http://mock-bank:8001
+    depends_on:
+      - mock-bank
+    networks:
+      - voxbank-network
+
+  mcp-transfer:
+    build: ./mcp-tools/transfer
+    ports:
+      - "8003:8003"
+    environment:
+      - BANK_API_URL=http://mock-bank:8001
+    depends_on:
+      - mock-bank
+    networks:
+      - voxbank-network
+
+  mcp-transactions:
+    build: ./mcp-tools/transactions
+    ports:
+      - "8005:8005"
+    environment:
+      - BANK_API_URL=http://mock-bank:8001
+    depends_on:
+      - mock-bank
+    networks:
+      - voxbank-network
+
+  mcp-loan-inquiry:
+    build: ./mcp-tools/loan_inquiry
+    ports:
+      - "8006:8006"
+    environment:
+      - BANK_API_URL=http://mock-bank:8001
+    depends_on:
+      - mock-bank
+    networks:
+      - voxbank-network
+
+  mcp-reminders:
+    build: ./mcp-tools/reminders
+    ports:
+      - "8007:8007"
+    environment:
+      - BANK_API_URL=http://mock-bank:8001
+    depends_on:
+      - mock-bank
+    networks:
+      - voxbank-network
+
+  # Auth Service
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "8004:8004"
+    networks:
+      - voxbank-network
+
+  # Reverse Proxy (NGINX)
+  nginx:
+    build: ./infra/reverse-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - orchestrator
+      - mock-bank
+      - auth-service
+    networks:
+      - voxbank-network
+
+networks:
+  voxbank-network:
+    driver: bridge
+

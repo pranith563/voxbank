@@ -1,0 +1,236 @@
+voxbank/
+│
+├── frontend/                     # Voice UI (React / React Native / Web)
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── pages/
+│   │   ├── services/
+│   │   ├── utils/
+│   │   └── App.tsx
+│   ├── package.json
+│   └── README.md
+│
+├── orchestrator/                 # LLM Orchestration + Conversation Engine
+│   ├── src/
+│   │   ├── app.py (FastAPI)
+│   │   ├── llm_agent.py
+│   │   ├── nlu/
+│   │   │   ├── intent_classifier.py
+│   │   │   └── entity_resolver.py
+│   │   ├── context/
+│   │   │   ├── session_manager.py
+│   │   │   └── memory.py
+│   │   ├── guards/
+│   │   │   ├── policy_engine.py
+│   │   │   └── risk_rules.py
+│   │   ├── clients/
+│   │   │   ├── mcp_client.py
+│   │   │   └── mock_bank_client.py
+│   │   └── schemas/
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── README.md
+│
+├── mcp-tools/                    # Secure MCP Tool Services (microservices)
+│   ├── balance/
+│   │   ├── app.py
+│   │   ├── schemas.py
+│   │   ├── service.py
+│   │   └── Dockerfile
+│   ├── transfer/
+│   │   ├── app.py
+│   │   ├── schemas.py
+│   │   ├── service.py
+│   │   └── Dockerfile
+│   ├── transactions/
+│   ├── loan_inquiry/
+│   ├── reminders/
+│   ├── common/
+│   │   ├── utils.py
+│   │   ├── auth.py
+│   │   └── validators.py
+│   ├── docker-compose.override.example.yml
+│   └── README.md
+│
+├── mock-bank/                    # Fake bank backend for testing tools
+│   ├── app.py                    # FastAPI mock DB of users/accounts/loans
+│   ├── db.json                   # Simple storage (or SQLite)
+│   ├── schemas.py
+│   └── Dockerfile
+│
+├── auth-service/                 # OTP + Voice Biometrics (mock)
+│   ├── app.py
+│   ├── otp/
+│   │   ├── otp_manager.py
+│   │   ├── sms_provider_mock.py
+│   ├── biometrics/
+│   │   ├── voiceprint_model.py
+│   │   └── matcher.py
+│   ├── schemas.py
+│   └── Dockerfile
+│
+├── data/                         # SQL schema, seed data, and migration scripts
+│   ├── schema.sql
+│   ├── seed.sql
+│   ├── er-diagram.png
+│   └── migrations/
+│
+├── infra/                        # Deployment, Infrastructure, DevOps
+│   ├── docker-compose.yml        # One-command demo setup
+│   ├── k8s/                      # (Optional) Kubernetes manifests
+│   │   ├── orchestrator.yaml
+│   │   ├── mock-bank.yaml
+│   │   ├── mcp-tools.yaml
+│   │   └── ingress.yaml
+│   ├── reverse-proxy/            # NGINX reverse proxy
+│   │   ├── nginx.conf
+│   └── README.md
+│
+├── docs/                         # Architecture, diagrams, PDF content
+│   ├── architecture-diagram.png
+│   ├── sequence-diagram.png
+│   ├── data-model.png
+│   ├── mcp-flow.png
+│   ├── security-model.png
+│   └── round2-submission.pdf     # Final submission (exported)
+│
+├── demo/                         # Demo assets
+│   ├── scripts/
+│   │   ├── balance_demo.txt
+│   │   ├── transfer_demo.txt
+│   │   ├── error_demo.txt
+│   ├── recordings/
+│   └── screenshots/
+│
+├── .github/                      # CI/CD
+│   ├── workflows/
+│   │   ├── ci.yml
+│   │   ├── docker-build.yml
+│   │   └── lint.yml
+│
+├── .env.example
+├── LICENSE
+└── README.md                     # Root README — setup + architecture + demo
+
+Explanation of Each Major Component
+1. /frontend
+
+UI for capturing microphone input & playing audio output.
+Includes:
+
+Start/stop mic
+
+Visual transcript display
+
+“Processing…” UI
+
+Playback of TTS responses
+
+Buttons for quick actions (optional)
+
+2. /orchestrator (The brain)
+
+Contains:
+
+LLM prompting logic
+
+NLU & intent classification
+
+Entity extraction
+
+Conversation session management
+
+Risk-based policy engine
+
+Calls MCP tools via HTTP or MCP client library
+
+This is the “AI Agent Controller.”
+
+3. /mcp-tools (The safe execution layer 🛡️)
+
+Each financial operation is a separate microservice:
+
+balance/
+
+transfer/
+
+transactions/
+
+loan_inquiry/
+
+reminders/
+
+Every tool has:
+
+schemas.py → JSON schema for input/output
+
+service.py → Business logic
+
+app.py → FastAPI wrapper
+
+LLM cannot bypass this layer.
+
+This makes your submission extremely strong in "security + compliance."
+
+4. /mock-bank
+
+A fake bank system:
+
+Stores fake accounts, balances, users
+
+Simulates insufficient funds, wrong OTP, etc.
+
+Responds to MCP tools via API
+
+Makes your whole prototype real and interactive.
+
+5. /auth-service
+
+Handles:
+
+OTP
+
+Voice biometrics match score
+
+Enrollment & verification
+
+For prototype: simple cosine similarity on speaker embeddings.
+
+6. /data
+
+SQL schema + seed data (test users & accounts).
+Judges like when they can run the system with sample data.
+
+7. /infra
+
+Includes both:
+
+docker-compose.yml (1-command demo for judges)
+
+optional Kubernetes manifests (shows scalability)
+
+8. /docs
+
+Place all diagrams here:
+
+Architecture
+
+Data model
+
+Sequence diagram
+
+MCP flow
+
+Security model
+
+Also place your final Round 2 PDF here.
+
+9. /demo
+
+Demo script (what you speak in the video)
+
+Screenshots
+
+Optional audio of sample queries

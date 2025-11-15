@@ -1,0 +1,17 @@
+VoxBank – Your AI Voice Banking Companion
+
+VoxBank is an AI-powered voice banking assistant that enables users to perform secure financial operations through natural conversation. It reimagines digital banking by combining speech recognition, large language models (LLMs), and secure tool orchestration via the Model Context Protocol (MCP). The result is a conversational, hands-free experience that makes banking accessible, intelligent, and effortless for everyone.
+
+In today’s digital world, customers expect intuitive and personalized experiences, yet many still struggle with complex app interfaces—especially senior citizens, visually impaired3333 users, and those less familiar with mobile banking. VoxBank bridges this gap by allowing users to simply speak naturally:
+
+“What’s my account balance?”, “Transfer ₹500 to Ramesh”, or “Remind me to pay my loan EMI tomorrow.”
+The assistant interprets intent, confirms details, and securely executes actions through mock banking APIs, ensuring speed, compliance, and trust at every step.
+
+At its core, VoxBank uses a hybrid architecture combining LLM reasoning with tool-based execution control. The LLM focuses on understanding and maintaining conversational context—handling multi-turn interactions, resolving ambiguities, and personalizing responses—while MCP tools safely encapsulate operations such as balance inquiries, fund transfers, or statement retrieval. This layered security model ensures that no sensitive data or API endpoint is directly exposed to the LLM. High-risk actions invoke voice-based verification or OTP validation, adhering to bank-grade security and data privacy norms. Every transaction is audited and logged, creating an explainable trail for compliance and observability.
+
+VoxBank’s conversational engine is context-aware, multilingual, and adaptive to regional accents. It gracefully manages errors—such as insufficient funds or invalid recipients—by guiding users with natural corrective prompts. The voice interface is powered by Whisper for ASR, text embeddings for intent extraction, TTS for human-like feedback, and a fine-tuned LLM for decision orchestration. Its modular API-driven design makes it easily integrable into existing mobile or web banking platforms, or even IoT devices and car dashboards, enabling banking on the go.
+
+From a customer experience perspective, VoxBank offers an always-available, emotionally intelligent assistant that reduces friction, eliminates screen dependency, and enhances trust through transparent confirmations. Users can multitask while banking securely—ideal for elderly or visually challenged users—creating a genuinely inclusive digital experience.
+
+For banks, VoxBank drives measurable value through reduced support costs, higher engagement, and stronger retention. A pilot can start with savings and fund transfer modules, gradually expanding to cards, loans, and investment advice. By uniting conversational AI, secure automation, and multilingual accessibility, VoxBank represents the future of conversational banking—intelligent, compliant, and built for everyone.
+

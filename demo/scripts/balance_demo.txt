@@ -1,0 +1,12 @@
+VoxBank Balance Inquiry Demo Script
+
+User: "What's my account balance?"
+System: "I'll check your account balance right away."
+[Processing...]
+System: "Your current account balance is ₹50,000.00 in your savings account ACC001."
+
+User: "How much do I have in my current account?"
+System: "Let me check your current account balance."
+[Processing...]
+System: "Your current account has a balance of ₹25,000.00."
+

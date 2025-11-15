@@ -1,0 +1,13 @@
+VoxBank Fund Transfer Demo Script
+
+User: "Transfer ₹500 to Ramesh"
+System: "I'll help you transfer ₹500 to Ramesh. Let me verify the details."
+[Processing...]
+System: "I found Ramesh Kumar in your contacts. Account number ACC003. Would you like to proceed with transferring ₹500 to Ramesh Kumar?"
+User: "Yes, confirm"
+System: "For security, I need to verify your identity. Please enter the OTP sent to your registered mobile number."
+[OTP Verification...]
+System: "OTP verified successfully. Transferring ₹500 to Ramesh Kumar..."
+[Processing...]
+System: "Transfer completed successfully! Transaction ID: TXN123456. ₹500 has been transferred from your account ACC001 to Ramesh Kumar's account ACC003."
+

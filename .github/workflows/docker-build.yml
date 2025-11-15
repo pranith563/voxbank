@@ -1,0 +1,21 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ main ]
+  tags:
+    - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker images
+      run: |
+        docker build -t voxbank/orchestrator:latest ./orchestrator
+        docker build -t voxbank/mock-bank:latest ./mock-bank
+        docker build -t voxbank/auth-service:latest ./auth-service
+

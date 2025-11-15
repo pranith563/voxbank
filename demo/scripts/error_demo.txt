@@ -1,0 +1,16 @@
+VoxBank Error Handling Demo Script
+
+Scenario 1: Insufficient Funds
+User: "Transfer ₹100,000 to Priya"
+System: "I'll help you transfer ₹100,000 to Priya."
+[Processing...]
+System: "I'm sorry, but you have insufficient funds. Your current balance is ₹50,000.00, which is less than the requested amount of ₹100,000. Would you like to transfer a different amount?"
+
+Scenario 2: Invalid Recipient
+User: "Send money to John"
+System: "I couldn't find John in your contacts. Could you please provide the account number or phone number?"
+
+Scenario 3: Network Error
+User: "What's my balance?"
+System: "I'm having trouble connecting to the banking system right now. Please try again in a moment."
+

@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-balance
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mcp-balance
+  template:
+    metadata:
+      labels:
+        app: mcp-balance
+    spec:
+      containers:
+      - name: mcp-balance
+        image: voxbank/mcp-balance:latest
+        ports:
+        - containerPort: 8002
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-balance-service
+spec:
+  selector:
+    app: mcp-balance
+  ports:
+  - port: 8002
+    targetPort: 8002
+
