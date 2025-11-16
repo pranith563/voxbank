@@ -6,33 +6,44 @@ MCP Tools adapter (FastAPI + FastMCP)
 - Uses a shared X-MCP-TOOL-KEY header for simple auth
 """
 
-from fastapi import FastAPI, Header, HTTPException, Request, status, Depends
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
 import os
-from dotenv import load_dotenv
 import logging
+from typing import Optional, Dict, Any, List
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException, status, Depends, Request
 import httpx
 import asyncio
 import uuid
 
 load_dotenv()
 
-MCP_TOOL_KEY = os.getenv("MCP_TOOL_KEY", "mcp-test-key")          # shared secret between orchestrator and MCP tools
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+MCP_TOOL_KEY = os.getenv("MCP_TOOL_KEY", "mcp-test-key")
 MOCK_BANK_BASE = os.getenv("MOCK_BANK_BASE_URL", "http://localhost:9000")
 REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "10"))
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("mcp_tools")
 
-app = FastAPI(title="MCP Tools - Mock Bank Adapter", version="1.0.0")
+# Try to import fastmcp; if not installed we'll still provide the HTTP endpoints
+try:
+    from fastmcp import FastMCP
+    FASTMCP_AVAILABLE = True
+except Exception:
+    FastMCP = None
+    FASTMCP_AVAILABLE = False
+    logger.warning("fastmcp not installed. MCP features will be disabled. Install via `pip install fastmcp` for LLM-friendly tools.")
 
-# Shared async client (reused)
+# FastAPI app (keeps your existing HTTP surface)
+app = FastAPI(title="MCP Tools (FastMCP-enabled)", version="1.1.0")
+
+# Shared httpx client
 _http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
 
 
 # -----------------------
-# Security dependency
+# Security dependency for HTTP endpoints
 # -----------------------
 async def verify_mcp_key(x_mcp_tool_key: Optional[str] = Header(None)):
     if not x_mcp_tool_key or x_mcp_tool_key != MCP_TOOL_KEY:
@@ -41,9 +52,24 @@ async def verify_mcp_key(x_mcp_tool_key: Optional[str] = Header(None)):
 
 
 # -----------------------
-# Request / Response models
+# Helper: call mock-bank
 # -----------------------
+async def call_mock_bank(method: str, path: str, json: Dict[str, Any] = None) -> Any:
+    url = MOCK_BANK_BASE.rstrip("/") + path
+    try:
+        resp = await _http_client.request(method, url, json=json)
+        logger.debug("Mock-bank %s %s -> %s", method.upper(), url, resp.status_code)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"mock-bank error: {resp.status_code} {resp.text}")
+        return resp.json()
+    except httpx.RequestError as e:
+        logger.exception("HTTPX request failed: %s", e)
+        raise HTTPException(status_code=502, detail="mock-bank unreachable")
 
+
+# -----------------------
+# HTTP request/response models (kept for backwards compatibility)
+# -----------------------
 class BalanceRequest(BaseModel):
     account_number: str
     session_id: Optional[str] = None
@@ -77,7 +103,7 @@ class TransactionItem(BaseModel):
 
 class TransactionsResponse(BaseModel):
     account_number: str
-    transactions: list[TransactionItem]
+    transactions: List[TransactionItem]
 
 
 class TransferRequest(BaseModel):
@@ -98,34 +124,11 @@ class TransferResponse(BaseModel):
 
 
 # -----------------------
-# Helpers
+# HTTP endpoints (backwards compatible)
 # -----------------------
-async def call_mock_bank(method: str, path: str, json: Dict[str, Any] = None):
-    url = MOCK_BANK_BASE.rstrip("/") + path
-    try:
-        resp = await _http_client.request(method, url, json=json)
-        logger.info("Mock-bank %s %s -> %s", method.upper(), url, resp.status_code)
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"mock-bank error: {resp.status_code} {resp.text}")
-        return resp.json()
-    except httpx.RequestError as e:
-        logger.exception("HTTPX request failed: %s", e)
-        raise HTTPException(status_code=502, detail="mock-bank unreachable")
-
-
-# -----------------------
-# Tools endpoints
-# -----------------------
-
 @app.post("/tools/balance", response_model=BalanceResponse, dependencies=[Depends(verify_mcp_key)])
 async def tool_balance(req: BalanceRequest):
-    """
-    Return account balance for a given account_number.
-    Orchestrator should call this to fetch latest balance before confirming high-risk actions.
-    """
-    # Query mock bank account endpoint
     data = await call_mock_bank("GET", f"/api/accounts/{req.account_number}")
-    # data expected to match AccountOut serialization
     return BalanceResponse(
         account_number=req.account_number,
         balance=float(data.get("balance", 0.0)),
@@ -137,12 +140,7 @@ async def tool_balance(req: BalanceRequest):
 
 @app.post("/tools/transactions", response_model=TransactionsResponse, dependencies=[Depends(verify_mcp_key)])
 async def tool_transactions(req: TransactionsRequest):
-    """
-    Return latest transactions for an account.
-    """
-    # call mock-bank transactions
     data = await call_mock_bank("GET", f"/api/accounts/{req.account_number}/transactions?limit={req.limit}")
-    # data should be a list of tx dicts
     txs = []
     for t in data:
         txs.append(TransactionItem(
@@ -160,15 +158,8 @@ async def tool_transactions(req: TransactionsRequest):
 
 @app.post("/tools/transfer", response_model=TransferResponse, dependencies=[Depends(verify_mcp_key)])
 async def tool_transfer(req: TransferRequest):
-    """
-    Execute a transfer via the mock bank API.
-    This endpoint is the high-risk tool — orchestrator must obtain user confirmation before calling.
-    """
-    # Server-side basic validation
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
-
-    # Call mock-bank transfer
     payload = {
         "from_account_number": req.from_account_number,
         "to_account_number": req.to_account_number,
@@ -178,7 +169,6 @@ async def tool_transfer(req: TransferRequest):
         "reference": req.reference
     }
     data = await call_mock_bank("POST", "/api/transfer", json=payload)
-    # expected mock-bank returns a TransferOut-like dict
     return TransferResponse(
         status=data.get("status", "failed"),
         transaction_reference=data.get("transaction_reference"),
@@ -188,32 +178,64 @@ async def tool_transfer(req: TransferRequest):
 
 
 # -----------------------
-# Health + shutdown
+# Tools metadata endpoint (useful for discovery)
 # -----------------------
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "mock_bank": MOCK_BANK_BASE}
+@app.get("/tools/metadata")
+async def tools_metadata():
+    """
+    Return a machine-readable description of curated tools.
+    This helps the orchestrator / agent discover tool signatures when FastMCP client is not used.
+    """
+    return [
+        {
+            "name": "balance",
+            "path": "/tools/balance",
+            "method": "POST",
+            "params": [{"name": "account_number", "type": "string", "required": True}],
+            "description": "Get account balance by account number"
+        },
+        {
+            "name": "transactions",
+            "path": "/tools/transactions",
+            "method": "POST",
+            "params": [{"name": "account_number", "type": "string", "required": True}, {"name": "limit", "type": "integer", "required": False}],
+            "description": "Fetch recent transactions"
+        },
+        {
+            "name": "transfer",
+            "path": "/tools/transfer",
+            "method": "POST",
+            "params": [
+                {"name":"from_account_number","type":"string","required":True},
+                {"name":"to_account_number","type":"string","required":True},
+                {"name":"amount","type":"number","required":True},
+                {"name":"currency","type":"string","required":False}
+            ],
+            "description": "Execute a funds transfer"
+        }
+    ]
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await _http_client.aclose()
 
-try:
-    from fastmcp import FastMCP
-    FASTMCP_AVAILABLE = True
-except Exception:
-    FastMCP = None
-    FASTMCP_AVAILABLE = False
-    logger.warning("fastmcp not installed. MCP features will be disabled. Install via `pip install fastmcp` for LLM-friendly tools.")
-
-try:
-    mcp = FastMCP.from_fastapi(app=app)  # auto-convert / integrate into same ASGI
-    logger.info("FastMCP initialized and attached to FastAPI app.")
-except Exception as e:
+# -----------------------
+# FastMCP integration (curated tools)
+# -----------------------
+# If FastMCP is available, create an MCP instance from this FastAPI app
+if FASTMCP_AVAILABLE:
+    try:
+        mcp = FastMCP.from_fastapi(app=app)  # auto-convert / integrate into same ASGI
+        logger.info("FastMCP initialized and attached to FastAPI app.")
+    except Exception as e:
+        mcp = None
+        logger.exception("Failed to initialize FastMCP from FastAPI app: %s", e)
+else:
     mcp = None
-    logger.exception("Failed to initialize FastMCP from FastAPI app: %s", e)
 
-# balance tool
+
+# Example curated tool implementations using the mcp.tool decorator.
+# These functions will be discoverable by the FastMCP runtime and are the
+# LLM-friendly typed callables the agent can inspect and call.
+if mcp:
+    # balance tool
     @mcp.tool(name="balance", description="Get account balance by account number")
     async def balance_tool(account_number: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -274,3 +296,14 @@ except Exception as e:
         logger.info("Mounted fastmcp http app at /mcp")
     except Exception as e:
         logger.exception("Failed to mount fastmcp http app: %s", e)
+
+
+# -----------------------
+# Shutdown
+# -----------------------
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        await _http_client.aclose()
+    except Exception:
+        pass
