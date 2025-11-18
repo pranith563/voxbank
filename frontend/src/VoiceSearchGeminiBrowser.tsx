@@ -177,6 +177,13 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
           return;
         }
 
+        if (parsed && parsed.type === "reply" && parsed.text) {
+          console.log("[WS] reply text:", parsed.text);
+          // Use browser TTS to speak the assistant reply.
+          speak(parsed.text);
+          return;
+        }
+
         console.log("[WS] Received text payload (unparsed):", msgText);
       } catch (err) {
         console.error("[WS] onmessage error:", err);
@@ -195,6 +202,22 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
   }
 
   // ---------- audio helpers ----------
+  function speak(text: string) {
+    if (!text) return;
+    if (!("speechSynthesis" in window)) {
+      console.warn("speechSynthesis not supported in this browser");
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.0;
+      window.speechSynthesis.speak(u);
+    } catch (e) {
+      console.error("Browser TTS failed:", e);
+    }
+  }
+
   function playArrayBufferAudio(buffer: ArrayBuffer, mime: string = "audio/wav") {
     try {
       const blob = new Blob([buffer], { type: mime });

@@ -40,7 +40,7 @@ export interface UseVoiceWebSocketReturn {
 
 export function useVoiceWebSocket(options: UseVoiceWebSocketOptions = {}): UseVoiceWebSocketReturn {
   const {
-    wsUrl = "ws://0.0.0.0:8765/ws",
+    wsUrl = "ws://0.0.0.0:8000/ws",
     sampleRate = 16000,
     channels = 1,
     encoding = "pcm16",

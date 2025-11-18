@@ -13,7 +13,7 @@ import { useVoiceSearch } from "@/hooks/useVoiceSearch";
  * Uses the useVoiceSearch hook for all voice-related functionality
  */
 
-export default function VoiceSearch({ wsUrl = "ws://0.0.0.0:8765/ws" }: { wsUrl?: string }): JSX.Element {
+export default function VoiceSearch({ wsUrl = "ws://0.0.0.0:8000/ws" }: { wsUrl?: string }): JSX.Element {
   const {
     listening,
     displayTranscript,

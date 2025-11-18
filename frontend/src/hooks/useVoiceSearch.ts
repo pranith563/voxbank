@@ -31,7 +31,7 @@ interface UseVoiceSearchReturn {
 
 export function useVoiceSearch(options: UseVoiceSearchOptions = {}): UseVoiceSearchReturn {
   const {
-    wsUrl = "ws://0.0.0.0:8765/ws",
+    wsUrl = "ws://0.0.0.0:8000/ws",
     speechThreshold = 0.01,
     silenceMs = 700,
     minEndIntervalMs = 600,
