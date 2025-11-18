@@ -12,7 +12,19 @@ const WS_URL = "ws://localhost:8000/ws";
 // 2 seconds silence
 const SILENCE_TIMEOUT_MS = 2000;
 
-export default function VoiceSearchGeminiBrowser(): JSX.Element {
+type AgentMode = "idle" | "listening" | "thinking" | "speaking";
+
+interface Props {
+  language?: string;
+  voiceType?: string;
+  sessionId: string;
+}
+
+export default function VoiceSearchGeminiBrowser({
+  language = "en-US",
+  voiceType = "default",
+  sessionId,
+}: Props): JSX.Element {
   // UI / recognition states
   const [listening, setListening] = useState(false);
   const listeningRef = useRef<boolean>(false);
@@ -35,6 +47,11 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
 
   // silence timer
   const silenceTimerRef = useRef<number | null>(null);
+
+  // Agent state + chat
+  const [agentMode, setAgentMode] = useState<AgentMode>("idle");
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
 
   // ---------- lifecycle ----------
   useEffect(() => {
@@ -160,28 +177,30 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
         let parsed = null;
         try { parsed = JSON.parse(msgText); } catch (e) { parsed = null; }
 
-        if (parsed && (parsed.type === "audio" || parsed.type === "audio_base64") && parsed.audio) {
-          console.log("[WS] Received base64 audio payload. Playing...");
-          const mime = parsed.mime || parsed.format || "audio/wav";
-          playBase64Audio(parsed.audio, mime);
-          return;
+    if (parsed && (parsed.type === "audio" || parsed.type === "audio_base64") && parsed.audio) {
+      console.log("[WS] Received base64 audio payload. Playing...");
+      const mime = parsed.mime || parsed.format || "audio/wav";
+      playBase64Audio(parsed.audio, mime);
+      return;
         }
 
-        if (parsed && parsed.type === "ack") {
-          console.log("[WS] Server ack:", parsed);
-          return;
+    if (parsed && parsed.type === "ack") {
+      console.log("[WS] Server ack:", parsed);
+      return;
         }
 
-        if (parsed && parsed.type === "transcript_echo" && parsed.text) {
-          console.log("[WS] server transcript echo:", parsed.text);
-          return;
-        }
+    if (parsed && parsed.type === "transcript_echo" && parsed.text) {
+      console.log("[WS] server transcript echo:", parsed.text);
+      return;
+    }
 
-        if (parsed && parsed.type === "reply" && parsed.text) {
-          console.log("[WS] reply text:", parsed.text);
-          // Use browser TTS to speak the assistant reply.
-          speak(parsed.text);
-          return;
+    if (parsed && parsed.type === "reply" && parsed.text) {
+      console.log("[WS] reply text:", parsed.text);
+      setAgentMode("speaking");
+      setChatMessages((prev) => [...prev, { role: "assistant", text: parsed.text }]);
+      // Use browser TTS to speak the assistant reply.
+      speak(parsed.text);
+      return;
         }
 
         console.log("[WS] Received text payload (unparsed):", msgText);
@@ -209,12 +228,26 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
       return;
     }
     try {
+      // Stop recognition while TTS is speaking to avoid sending echoed text back
+      if (listeningRef.current) {
+        stopRecognition();
+      }
+      pausedForPlaybackRef.current = true;
+      setPausedForPlayback(true);
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.rate = 1.0;
+      u.onend = () => {
+        pausedForPlaybackRef.current = false;
+        setPausedForPlayback(false);
+        setAgentMode("idle");
+      };
       window.speechSynthesis.speak(u);
     } catch (e) {
       console.error("Browser TTS failed:", e);
+      pausedForPlaybackRef.current = false;
+      setPausedForPlayback(false);
+      setAgentMode("idle");
     }
   }
 
@@ -281,14 +314,24 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       wsRef.current = createWebSocket();
       wsRef.current.onopen = () => {
-        try { wsRef.current?.send(JSON.stringify({ type: "transcript", text: newText })); }
+        try {
+          wsRef.current?.send(
+            JSON.stringify({ type: "transcript", text: newText, session_id: sessionId }),
+          );
+        }
         catch (e) { console.error("[WS] send error after open", e); }
       };
     } else {
-      try { wsRef.current.send(JSON.stringify({ type: "transcript", text: newText })); }
+      try {
+        wsRef.current.send(
+          JSON.stringify({ type: "transcript", text: newText, session_id: sessionId }),
+        );
+      }
       catch (e) { console.error("[WS] send error", e); }
     }
 
+    setAgentMode("thinking");
+    setChatMessages((prev) => [...prev, { role: "user", text: newText }]);
     console.log("[Send] sent new text:", newText);
     lastSentCharIndexRef.current = full.length;
   }
@@ -316,7 +359,7 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
     const recognition = new SRConstructor();
     recognitionRef.current = recognition;
 
-    recognition.lang = "en-US";
+    recognition.lang = language || "en-US";
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
     recognition.continuous = true;
@@ -360,6 +403,8 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
         recognitionRef.current = null;
       }
       console.log("[SR] onend fired; recognitionRef cleared");
+      // If not already thinking or speaking, revert to idle
+      setAgentMode((mode) => (mode === "thinking" || mode === "speaking" ? mode : "idle"));
     };
 
     try {
@@ -367,6 +412,7 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
       startOrResetSilenceTimer(); // fallback if no results
       listeningRef.current = true;
       setListening(true);
+      setAgentMode("listening");
       userStoppedRef.current = false;
       console.log("[SR] recognition.start() called");
     } catch (err) {
@@ -387,6 +433,7 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
     setListening(false);
     // ensure ref cleared
     recognitionRef.current = null;
+    setAgentMode("idle");
   }
 
   // ---------- UI handlers ----------
@@ -423,94 +470,124 @@ export default function VoiceSearchGeminiBrowser(): JSX.Element {
   }
 
   // ---------- Render ----------
-  // show SVG waves when either listening or paused for playback (visual keeps playing)
-  const showWaves = listening || pausedForPlayback;
+  const showWaves = agentMode !== "idle";
+  const modeLabel =
+    agentMode === "listening"
+      ? "Listening..."
+      : agentMode === "thinking"
+      ? "Thinking..."
+      : agentMode === "speaking"
+      ? "Speaking..."
+      : "Tap to speak";
+
+  const ringColor =
+    agentMode === "listening"
+      ? "bg-blue-600 shadow-[0_0_40px_rgba(37,99,235,0.7)]"
+      : agentMode === "thinking"
+      ? "bg-indigo-600 shadow-[0_0_40px_rgba(79,70,229,0.7)]"
+      : agentMode === "speaking"
+      ? "bg-emerald-600 shadow-[0_0_40px_rgba(16,185,129,0.7)]"
+      : "bg-slate-800 shadow-xl";
 
   return (
-    <div className="w-full flex flex-col items-center">
-      <div className="w-full max-w-3xl px-4">
-        <div className="flex gap-3 items-center mb-6">
-          <input
-            className="flex-1 rounded-2xl border border-slate-200 px-4 py-3 shadow-inner focus:outline-none"
-            placeholder="Speak or type to search..."
-            value={transcript}
-            onChange={(e) => {
-              setTranscript(e.target.value);
-              finalTranscriptRef.current = e.target.value;
-            }}
-          />
-          <button
-            onClick={handleManualSend}
-            className="rounded-2xl border px-4 py-3 bg-white hover:bg-slate-50"
-          >
-            Search
-          </button>
-        </div>
-
-        <div className="rounded-2xl border border-slate-100 p-6 mb-6 bg-white shadow-sm">
-          <div className="text-xs text-slate-400 mb-2">Transcription</div>
-          <div className="text-base text-slate-700 min-h-[44px]">
-            {transcript || (interim ? interim : "No speech yet")}
-          </div>
-        </div>
-
-        <div className="flex flex-col items-center">
+    <>
+      <div className="w-full flex flex-col items-center justify-center py-10">
+        <div className="flex flex-col items-center gap-6">
+          {/* Mic button */}
           <div
             onClick={handleMicClick}
             role="button"
             aria-pressed={listening}
-            className="relative w-[120px] h-[120px] rounded-full bg-white shadow-lg flex items-center justify-center cursor-pointer select-none"
+            className={`relative w-40 h-40 rounded-full flex items-center justify-center cursor-pointer select-none transition-shadow duration-300 ${ringColor}`}
           >
-            <div className="w-8 h-8 rounded-full bg-red-600 shadow-inner" />
-            {/* SVG animated radiating waves */}
+            {/* Inner mic icon */}
+            <div className="w-16 h-16 rounded-full bg-slate-900 flex items-center justify-center">
+              <span className="text-3xl text-white">🎙</span>
+            </div>
+
+            {/* Animated ring */}
             {showWaves && (
-              <svg className="absolute inset-0 w-full h-full" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
-                <defs>
-                  <radialGradient id="g1" cx="50%" cy="50%">
-                    <stop offset="0%" stopColor="rgba(229,57,53,0.08)" />
-                    <stop offset="100%" stopColor="rgba(229,57,53,0.02)" />
-                  </radialGradient>
-                </defs>
-                <circle cx="60" cy="60" r="28" fill="url(#g1)" />
+              <svg
+                className="absolute inset-0 w-full h-full"
+                viewBox="0 0 160 160"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+                aria-hidden
+              >
                 <g>
-                  {/* three expanding rings animated */}
-                  <circle cx="60" cy="60" r="36" stroke="rgba(229,57,53,0.12)" strokeWidth="2" >
-                    <animate attributeName="r" from="36" to="52" dur="1.6s" repeatCount="indefinite" />
+                  <circle cx="80" cy="80" r="52" stroke="rgba(255,255,255,0.20)" strokeWidth="2">
+                    <animate attributeName="r" from="52" to="72" dur="1.6s" repeatCount="indefinite" />
                     <animate attributeName="opacity" from="0.9" to="0" dur="1.6s" repeatCount="indefinite" />
                   </circle>
-                  <circle cx="60" cy="60" r="28" stroke="rgba(229,57,53,0.10)" strokeWidth="2" >
-                    <animate attributeName="r" from="28" to="48" dur="1.6s" begin="0.5s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" from="0.85" to="0" dur="1.6s" begin="0.5s" repeatCount="indefinite" />
+                  <circle cx="80" cy="80" r="42" stroke="rgba(255,255,255,0.15)" strokeWidth="2">
+                    <animate attributeName="r" from="42" to="68" dur="1.6s" begin="0.4s" repeatCount="indefinite" />
+                    <animate attributeName="opacity" from="0.8" to="0" dur="1.6s" begin="0.4s" repeatCount="indefinite" />
                   </circle>
-                  <circle cx="60" cy="60" r="20" stroke="rgba(229,57,53,0.08)" strokeWidth="2" >
-                    <animate attributeName="r" from="20" to="44" dur="1.6s" begin="1s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" from="0.8" to="0" dur="1.6s" begin="1s" repeatCount="indefinite" />
+                  <circle cx="80" cy="80" r="34" stroke="rgba(255,255,255,0.10)" strokeWidth="2">
+                    <animate attributeName="r" from="34" to="60" dur="1.6s" begin="0.8s" repeatCount="indefinite" />
+                    <animate attributeName="opacity" from="0.7" to="0" dur="1.6s" begin="0.8s" repeatCount="indefinite" />
                   </circle>
                 </g>
               </svg>
             )}
           </div>
 
-          <div className="mt-3 text-sm text-slate-600">
-            {pausedForPlayback ? (
-              <span className="text-amber-600 font-semibold">Paused for reply</span>
-            ) : (
-              <span>{listening ? "Listening..." : "Tap to speak"}</span>
-            )}
+          {/* Mode label */}
+          <div className="px-6 py-2 rounded-full bg-slate-900/90 text-white text-sm shadow-md mt-2">
+            {modeLabel}
+          </div>
+
+          {/* Transcript below mic */}
+          <div className="mt-4 w-full max-w-xl text-center text-sm text-slate-700 min-h-[40px] px-4 py-3 rounded-2xl bg-white/80 border border-slate-200 shadow-sm">
+            {transcript || (interim ? interim : "No speech yet")}
           </div>
 
           <div className="mt-2 text-xs text-slate-400">
-            Auto-sends after 2s silence. Re-click mic to stop playback & listening.
+            Auto-sends after 2s of silence. Tap again to stop listening or playback.
           </div>
         </div>
       </div>
 
-      {/* debug */}
-      <div className="mt-8 text-xs text-slate-400">
-        <div>Recognition supported: {String(recognitionSupported)}</div>
-        <div>Listening (recognition running): {String(listeningRef.current)}</div>
-        <div>Paused for reply (playback): {String(pausedForPlayback)}</div>
+      {/* Collapsible chat window */}
+      <div className="fixed bottom-4 right-4 z-40">
+        <button
+          type="button"
+          onClick={() => setChatOpen((v) => !v)}
+          className="w-10 h-10 rounded-full bg-slate-900 text-white flex items-center justify-center shadow-lg hover:bg-slate-800 text-lg"
+          aria-label="Toggle chat history"
+        >
+          💬
+        </button>
+        {chatOpen && (
+          <div className="mt-2 w-80 max-h-96 bg-white shadow-2xl rounded-xl border border-slate-200 flex flex-col">
+            <div className="px-3 py-2 text-xs font-semibold text-slate-700 border-b border-slate-100 flex items-center justify-between">
+              <span>Conversation</span>
+              <span className="text-[10px] text-slate-400">user ↔ assistant</span>
+            </div>
+            <div className="p-3 flex-1 overflow-y-auto space-y-2 text-xs">
+              {chatMessages.length === 0 && (
+                <div className="text-slate-400">No messages yet.</div>
+              )}
+              {chatMessages.map((m, idx) => (
+                <div
+                  key={idx}
+                  className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`px-2 py-1 rounded-lg max-w-[75%] ${
+                      m.role === "user"
+                        ? "bg-slate-900 text-white"
+                        : "bg-slate-100 text-slate-800"
+                    }`}
+                  >
+                    {m.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
-    </div>
+    </>
   );
 }

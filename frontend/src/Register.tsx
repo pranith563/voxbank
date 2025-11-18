@@ -6,7 +6,11 @@ interface RegisterResult {
   error?: string;
 }
 
-export default function Register(): JSX.Element {
+interface RegisterProps {
+  onRegistered?: (user: any) => void;
+}
+
+export default function Register({ onRegistered }: RegisterProps): JSX.Element {
   const [username, setUsername] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [email, setEmail] = useState("");
@@ -87,7 +91,8 @@ export default function Register(): JSX.Element {
         audio_data: audioBase64,
       };
 
-      const resp = await fetch("/api/auth/register", {
+      // Call mock-bank register endpoint directly
+      const resp = await fetch("http://localhost:9000/api/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -98,7 +103,11 @@ export default function Register(): JSX.Element {
         setStatusMsg(`Registration failed: ${json.detail || json.message || resp.status}`);
       } else {
         const result = json as RegisterResult;
-        setStatusMsg(`Registered successfully as ${result.user?.username || username}.`);
+        const user = result.user || { username };
+        setStatusMsg(`Registered successfully as ${user.username || username}.`);
+        if (onRegistered) {
+          onRegistered(user);
+        }
       }
     } catch (err) {
       console.error("Register request failed", err);
@@ -220,4 +229,3 @@ export default function Register(): JSX.Element {
     </div>
   );
 }
-
