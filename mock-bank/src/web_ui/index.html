@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Voice Auth — Register / Login</title>
+<style>
+  body { font-family: Inter, system-ui, Arial; max-width: 880px; margin: 28px auto; padding: 0 16px; color:#0b1220; }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  .card { border: 1px solid #e6e9ee; padding: 16px; border-radius: 8px; box-shadow: 0 1px 6px rgba(16,24,40,0.03); margin-bottom: 18px;}
+  button { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; cursor:pointer; }
+  button.primary { background:#0b5cff; color:white; border-color:#0a4ad6; }
+  .rec-dot{width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block;margin-right:8px;}
+  ul { padding-left: 18px; }
+  .clip-item { display:flex; align-items:center; gap:8px; margin:6px 0;}
+  input[type="text"]{ padding:6px 8px; border-radius:6px; border:1px solid #cbd5e1; }
+  .small { font-size:13px; color:#475569; }
+</style>
+</head>
+<body>
+  <h1>Voice Auth — Registration & Login (client)</h1>
+
+  <div class="card">
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+      <input id="username" type="text" placeholder="username (e.g. pranith)" />
+      <button id="startRec">Start Recording</button>
+      <button id="stopRec" disabled>Stop</button>
+      <span id="recStatus" class="small"></span>
+    </div>
+
+    <div class="small">Recorded clips (you can take multiple for stronger enrollment):</div>
+    <div id="clips"></div>
+
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button id="uploadRegister" class="primary">Register (upload all clips)</button>
+      <button id="clearClips">Clear clips</button>
+    </div>
+
+    <div style="margin-top:12px;" id="registerResult"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0;">Login (single clip)</h2>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <input id="usernameLogin" type="text" placeholder="username" />
+      <button id="startRecLogin">Start</button>
+      <button id="stopRecLogin" disabled>Stop</button>
+    </div>
+    <div id="loginClip"></div>
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button id="uploadLogin" class="primary">Login</button>
+      <button id="clearLoginClip">Clear</button>
+    </div>
+    <div style="margin-top:12px;" id="loginResult"></div>
+  </div>
+
+<script>
+/*
+  Browser WAV recorder (PCM16) using WebAudio API and MediaRecorder stream.
+  We implement: start/stop recording, convert Float32 -> PCM16 WAV blob.
+*/
+
+let audioContext = null;
+let mediaStream = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+
+// UI elements
+const startRec = document.getElementById("startRec");
+const stopRec = document.getElementById("stopRec");
+const recStatus = document.getElementById("recStatus");
+const clipsDiv = document.getElementById("clips");
+const uploadRegister = document.getElementById("uploadRegister");
+const clearClips = document.getElementById("clearClips");
+const registerResult = document.getElementById("registerResult");
+const usernameInput = document.getElementById("username");
+
+const startRecLogin = document.getElementById("startRecLogin");
+const stopRecLogin = document.getElementById("stopRecLogin");
+const loginClipDiv = document.getElementById("loginClip");
+const uploadLogin = document.getElementById("uploadLogin");
+const clearLoginClip = document.getElementById("clearLoginClip");
+const usernameLogin = document.getElementById("usernameLogin");
+const loginResult = document.getElementById("loginResult");
+
+let registerClips = []; // array of {blob, url}
+let loginClip = null;
+
+/* Helpers: convert recorded Blob (webm/ogg) to WAV PCM16 via OfflineAudioContext */
+async function decodeToWavBlob(blob){
+  // decode audio via AudioContext.decodeAudioData and then encode to WAV PCM16
+  if(!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  // Mix down to mono
+  const chCount = audioBuffer.numberOfChannels;
+  const len = audioBuffer.length;
+  const sampleRate = 16000; // target rate - keep same as backend
+  // resample using OfflineAudioContext
+  const offlineCtx = new OfflineAudioContext(1, Math.ceil(audioBuffer.duration * sampleRate), sampleRate);
+  const bufferSource = offlineCtx.createBufferSource();
+  // create mono buffer
+  const mono = offlineCtx.createBuffer(1, audioBuffer.length, audioBuffer.sampleRate);
+  const out = mono.getChannelData(0);
+  // average channels to mono
+  for(let c=0;c<chCount;c++){
+    const chData = audioBuffer.getChannelData(c);
+    for(let i=0;i<chData.length;i++) out[i] = (out[i] || 0) + chData[i]/chCount;
+  }
+  bufferSource.buffer = mono;
+  bufferSource.connect(offlineCtx.destination);
+  bufferSource.start(0);
+  const rendered = await offlineCtx.startRendering(); // returns AudioBuffer at sampleRate
+  // encode to WAV PCM16
+  const wavBuffer = audioBufferToWav(rendered, sampleRate);
+  return new Blob([wavBuffer], {type: "audio/wav"});
+}
+
+// encode audio buffer (mono) -> WAV (PCM16) Uint8Array
+function audioBufferToWav(buffer, sampleRate) {
+  const numChannels = buffer.numberOfChannels;
+  const format = 1; // PCM
+  const bitDepth = 16;
+
+  const samples = buffer.getChannelData(0);
+  const bytesPerSample = bitDepth / 8;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample * numChannels;
+  const bufferLength = 44 + dataSize;
+  const arrayBuffer = new ArrayBuffer(bufferLength);
+  const view = new DataView(arrayBuffer);
+
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* RIFF chunk length */
+  view.setUint32(4, 36 + dataSize, true);
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, format, true);
+  /* channel count */
+  view.setUint16(22, numChannels, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, byteRate, true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, blockAlign, true);
+  /* bits per sample */
+  view.setUint16(34, bitDepth, true);
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
+  view.setUint32(40, dataSize, true);
+
+  // write PCM samples
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+
+  return arrayBuffer;
+}
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+/* Recording control for registration (allows multiple clips) */
+startRec.addEventListener("click", async () => {
+  startRec.disabled = true;
+  stopRec.disabled = false;
+  recStatus.innerHTML = '<span class="rec-dot"></span>Recording...';
+  recordedChunks = [];
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(mediaStream);
+  mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) recordedChunks.push(e.data); };
+  mediaRecorder.start();
+});
+
+stopRec.addEventListener("click", async () => {
+  stopRec.disabled = true;
+  startRec.disabled = false;
+  recStatus.textContent = "Processing clip...";
+  mediaRecorder.stop();
+  mediaRecorder.onstop = async () => {
+    // combine chunks
+    const blob = new Blob(recordedChunks, { type: recordedChunks[0]?.type || 'audio/webm' });
+    // convert to WAV PCM16
+    const wavBlob = await decodeToWavBlob(blob);
+    const url = URL.createObjectURL(wavBlob);
+    registerClips.push({ blob: wavBlob, url });
+    renderClips();
+    if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+    recStatus.textContent = "";
+  };
+});
+
+/* Recording control for login (single clip) */
+startRecLogin.addEventListener("click", async () => {
+  startRecLogin.disabled = true;
+  stopRecLogin.disabled = false;
+  loginResult.textContent = "";
+  recordedChunks = [];
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(mediaStream);
+  mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) recordedChunks.push(e.data); };
+  mediaRecorder.start();
+});
+stopRecLogin.addEventListener("click", async () => {
+  stopRecLogin.disabled = true;
+  startRecLogin.disabled = false;
+  loginResult.textContent = "Processing clip...";
+  mediaRecorder.stop();
+  mediaRecorder.onstop = async () => {
+    const blob = new Blob(recordedChunks, { type: recordedChunks[0]?.type || 'audio/webm' });
+    const wavBlob = await decodeToWavBlob(blob);
+    const url = URL.createObjectURL(wavBlob);
+    loginClip = { blob: wavBlob, url };
+    renderLoginClip();
+    if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+    loginResult.textContent = "";
+  };
+});
+
+function renderClips(){
+  clipsDiv.innerHTML = "";
+  registerClips.forEach((c, idx)=>{
+    const el = document.createElement("div");
+    el.className = "clip-item";
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = c.url;
+    const rm = document.createElement("button");
+    rm.textContent = "Remove";
+    rm.onclick = () => { URL.revokeObjectURL(c.url); registerClips.splice(idx,1); renderClips(); };
+    el.appendChild(audio);
+    el.appendChild(rm);
+    clipsDiv.appendChild(el);
+  });
+}
+
+function renderLoginClip(){
+  loginClipDiv.innerHTML = "";
+  if(!loginClip) return;
+  const audio = document.createElement("audio");
+  audio.controls = true;
+  audio.src = loginClip.url;
+  const rm = document.createElement("button");
+  rm.textContent = "Remove";
+  rm.onclick = () => { URL.revokeObjectURL(loginClip.url); loginClip = null; renderLoginClip(); };
+  loginClipDiv.appendChild(audio);
+  loginClipDiv.appendChild(rm);
+}
+
+/* Upload register: posts all clips as files[] to /register/{username} */
+uploadRegister.addEventListener("click", async () => {
+  registerResult.textContent = "";
+  const uname = (usernameInput.value || "").trim();
+  if(!uname){ registerResult.textContent = "Enter username."; return; }
+  if(registerClips.length === 0){ registerResult.textContent = "Record at least one clip."; return; }
+
+  const fd = new FormData();
+  registerClips.forEach((c, i) => fd.append("files", c.blob, `clip-${i+1}.wav`));
+  try{
+    const resp = await fetch(`/register/${encodeURIComponent(uname)}`, { method: "POST", body: fd });
+    const j = await resp.json();
+    if(resp.ok) {
+      registerResult.innerHTML = `<span style="color:green">Registered: ${JSON.stringify(j)}</span>`;
+      registerClips = [];
+      renderClips();
+    } else {
+      registerResult.innerHTML = `<span style="color:red">Error: ${j.detail || JSON.stringify(j)}</span>`;
+    }
+  }catch(err){
+    registerResult.innerHTML = `<span style="color:red">Network error: ${err}</span>`;
+  }
+});
+
+/* Upload login: posts single file to /login/{username} */
+uploadLogin.addEventListener("click", async () => {
+  loginResult.textContent = "";
+  const uname = (usernameLogin.value || "").trim();
+  if(!uname){ loginResult.textContent = "Enter username."; return; }
+  if(!loginClip){ loginResult.textContent = "Record a clip for login."; return; }
+  const fd = new FormData();
+  fd.append("file", loginClip.blob, "login.wav");
+  try{
+    const resp = await fetch(`/login/${encodeURIComponent(uname)}`, { method: "POST", body: fd });
+    const j = await resp.json();
+    if(resp.ok) {
+      loginResult.innerHTML = `<span style="color:green">Success: ${JSON.stringify(j)}</span>`;
+    } else {
+      loginResult.innerHTML = `<span style="color:${j.ok? 'green':'red'}">${JSON.stringify(j)}</span>`;
+    }
+  }catch(err){
+    loginResult.innerHTML = `<span style="color:red">Network error: ${err}</span>`;
+  }
+});
+
+clearClips.addEventListener("click", ()=>{ registerClips.forEach(c=>URL.revokeObjectURL(c.url)); registerClips=[]; renderClips(); });
+clearLoginClip.addEventListener("click", ()=>{ if(loginClip) URL.revokeObjectURL(loginClip.url); loginClip = null; renderLoginClip(); });
+
+</script>
+</body>
+</html>
