@@ -316,6 +316,45 @@ class LLMAgent:
         logger.info("Auth: username %s not found in mock-bank", username)
         return None
 
+    async def _login_user_via_mcp_or_http(self, username: str, passphrase: str) -> Optional[Dict[str, Any]]:
+        """
+        Validate username + passphrase via MCP `login_user` tool if available,
+        otherwise fall back to calling mock-bank /api/login directly.
+        Returns a dict with at least user_id/username on success, or None on failure.
+        """
+        # 1) Try MCP tool if mcp_client is wired
+        if self.mcp_client is not None:
+            try:
+                logger.info("AUTH: attempting MCP login_user for %s", username)
+                res = await self.mcp_client.call_tool("login_user", {"username": username, "passphrase": passphrase})
+                if res.get("status") in ("ok", "success") and res.get("user_id"):
+                    logger.info("AUTH: MCP login_user success for %s", username)
+                    return res
+                logger.warning("AUTH: MCP login_user failed for %s: %s", username, res)
+            except Exception as e:
+                logger.exception("AUTH: MCP login_user call failed for %s: %s", username, e)
+
+        # 2) Fallback: direct HTTP to mock-bank
+        base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+        if not base:
+            logger.warning("VOX_BANK_BASE_URL not configured; cannot perform HTTP login")
+            return None
+
+        url = f"{base}/api/login"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json={"username": username, "passphrase": passphrase})
+                if resp.status_code != 200:
+                    logger.warning("AUTH: HTTP login failed for %s: %s", username, resp.text)
+                    return None
+                data = resp.json()
+                if data.get("user_id"):
+                    logger.info("AUTH: HTTP login success for %s", username)
+                    return data
+        except Exception as e:
+            logger.exception("AUTH: HTTP login call failed for %s: %s", username, e)
+        return None
+
     async def _handle_auth_flow(self, transcript: str, session_id: str) -> Dict[str, Any]:
         """
         Rule-based login/registration dialogue handler.
@@ -362,19 +401,22 @@ class LLMAgent:
             self._append_history(session_id, {"role": "assistant", "text": msg})
             return {"status": "clarify", "message": msg}
 
-        # Stage 3: login - check passphrase (demo: accept any non-empty)
+        # Stage 3: login - check passphrase (validate via MCP/HTTP)
         if stage == "await_login_passphrase":
             if not text:
                 msg = "I didn't catch your passphrase. Please say it again."
                 self._append_history(session_id, {"role": "assistant", "text": msg})
                 return {"status": "clarify", "message": msg}
 
-            user = state["temp"].get("user_record") or {}
-            username = state["temp"].get("username") or user.get("username") or "user"
-            user_id = user.get("user_id") or username
+            username = state["temp"].get("username") or "user"
+            login_res = await self._login_user_via_mcp_or_http(username, text)
+            if not login_res:
+                msg = "The passphrase you provided doesn't match our records. Please try again."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
 
-            # For now, accept any passphrase but log the event for future tightening.
-            logger.info("AUTH: login success for username=%s user_id=%s (passphrase accepted demo-only)", username, user_id)
+            user_id = login_res.get("user_id") or username
+            logger.info("AUTH: login success for username=%s user_id=%s", username, user_id)
             state["authenticated"] = True
             state["user_id"] = user_id
             state["flow_stage"] = None
@@ -400,9 +442,6 @@ class LLMAgent:
                 self._append_history(session_id, {"role": "assistant", "text": msg})
                 return {"status": "clarify", "message": msg}
 
-            # In this prototype we don't have a dedicated mock-bank user creation endpoint.
-            # We still collect a passphrase and treat the session as authenticated
-            # once the user confirms it, so account tools remain gated by this session identity.
             state["flow_stage"] = "await_register_passphrase"
             msg = f"Username '{username}' is available. Please choose a passphrase."
             self._append_history(session_id, {"role": "assistant", "text": msg})
@@ -416,9 +455,9 @@ class LLMAgent:
                 return {"status": "clarify", "message": msg}
 
             username = state["temp"].get("username") or "user"
-            # For now we simulate user creation; future work can call a mock-bank user-create API.
+            # For now we simulate user creation; UI-based registration will hit mock-bank directly.
             user_id = username
-            logger.info("AUTH: registration success for username=%s (simulated user_id=%s)", username, user_id)
+            logger.info("AUTH: registration success for username=%s (session-only user_id=%s)", username, user_id)
 
             state["authenticated"] = True
             state["user_id"] = user_id
@@ -690,10 +729,14 @@ class LLMAgent:
             if action == "call_tool" and requires_tool and tool_name:
                 logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
 
-                # Gate account-specific tools behind login/registration
-                if not parse_only and tool_name in ("balance", "transactions", "transfer") and not self.is_authenticated(session_id):
-                    logger.info("AUTH: session %s not authenticated; prompting for login/registration before tool %s", session_id, tool_name)
-                    # Start auth flow if not already started
+                # Gate all tools that are not explicitly auth/utility tools behind login/registration.
+                auth_tools = {"register_user", "login_user", "set_user_audio_embedding", "get_user_profile", "list_tools"}
+                if not parse_only and not self.is_authenticated(session_id) and tool_name not in auth_tools:
+                    logger.info(
+                        "AUTH: session %s not authenticated; prompting for login/registration before tool %s",
+                        session_id,
+                        tool_name,
+                    )
                     state = self._get_auth_state(session_id)
                     if not state.get("flow_stage"):
                         state["flow_stage"] = "await_choice"

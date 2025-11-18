@@ -89,6 +89,10 @@ class RegisterResponse(BaseModel):
     user: Dict[str, Any]
 
 
+class LogoutRequest(BaseModel):
+    session_id: str
+
+
 # FastAPI app
 app = FastAPI(title="VoxBank Orchestrator", version="1.0.0")
 
@@ -206,6 +210,38 @@ async def root():
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.post("/api/auth/logout")
+async def logout(req: LogoutRequest):
+    """
+    Clear authentication/session state for a given session_id.
+    Used by the frontend when the user clicks Logout.
+    """
+    session_id = req.session_id
+    logger.info("API Request: POST /api/auth/logout | session_id=%s", session_id)
+
+    # Clear orchestrator session
+    sess = session_manager.get_session(session_id)
+    if sess:
+        sess["user_id"] = None
+        sess["pending_action"] = None
+        sess["pending_clarification"] = None
+
+    # Clear agent auth state
+    agent: LLMAgent = app.state.agent
+    if session_id in agent.auth_state:
+        try:
+            del agent.auth_state[session_id]
+        except Exception:
+            agent.auth_state[session_id] = {
+                "authenticated": False,
+                "user_id": None,
+                "flow_stage": None,
+                "temp": {},
+            }
+
+    return {"status": "ok"}
 
 
 @app.post("/api/auth/register", response_model=RegisterResponse)
