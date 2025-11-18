@@ -23,6 +23,7 @@ yarn-error.log*
 dist/
 build/
 .vite/
+package-lock.json
 
 # Environment
 .env
