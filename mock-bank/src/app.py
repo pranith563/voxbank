@@ -1,6 +1,8 @@
 # mock-bank/src/app.py
 import os
 import logging
+import base64
+import io
 from decimal import Decimal
 from typing import List, Optional, Any
 from uuid import UUID, uuid4
@@ -20,6 +22,19 @@ load_dotenv()
 # logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("mock_bank")
+
+# Optional voice embedding support via Resemblyzer
+try:
+    from resemblyzer import VoiceEncoder, preprocess_wav  # type: ignore
+    import soundfile as sf  # type: ignore
+
+    VOICE_EMBEDDER_AVAILABLE = True
+    _voice_encoder = VoiceEncoder()
+    logger.info("Voice embedding: Resemblyzer encoder initialized")
+except Exception as e:  # pragma: no cover - optional dependency
+    VOICE_EMBEDDER_AVAILABLE = False
+    _voice_encoder = None
+    logger.warning("Voice embedding libraries not available: %s", e)
 
 # Async DB session & models (assumes these files exist under mock-bank/src/db/)
 try:
@@ -114,6 +129,7 @@ class UserCreate(BaseModel):
     address: Optional[str] = None
     date_of_birth: Optional[str] = None  # ISO date string
     audio_embedding: Optional[Any] = None
+    audio_data: Optional[str] = None  # base64-encoded audio (optional)
 
 
 class LoginRequest(BaseModel):
@@ -136,6 +152,29 @@ class AudioEmbeddingUpdate(BaseModel):
 class AudioEmbeddingOut(BaseModel):
     user_id: UUID
     audio_embedding: Any
+
+
+def _extract_voice_embedding(audio_bytes: bytes) -> Optional[list[float]]:
+    """
+    Create a voice embedding vector from raw audio bytes.
+    Uses Resemblyzer when available, otherwise falls back to a simple stub.
+    """
+    if not audio_bytes:
+        return None
+
+    if VOICE_EMBEDDER_AVAILABLE and _voice_encoder is not None:
+        try:
+            # Attempt to read audio bytes (expects a standard audio container, e.g. WAV).
+            wav, sr = sf.read(io.BytesIO(audio_bytes))
+            wav = preprocess_wav(wav, source_sr=sr)
+            emb = _voice_encoder.embed_utterance(wav)
+            return [float(x) for x in emb]
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("Voice embedding extraction failed; falling back to stub: %s", e)
+
+    # Stub fallback: deterministic vector based on length only.
+    length = float(len(audio_bytes))
+    return [length, 0.0, 0.0]
 
 # --------------------
 # DB helper dependency
@@ -265,6 +304,22 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
     # In a real system, you would compute a salted hash and store only the hash.
     password_hash = payload.passphrase
 
+    # Determine audio_embedding:
+    #  - If provided explicitly, trust it.
+    #  - Else, if audio_data present, decode and compute embedding.
+    audio_embedding = payload.audio_embedding
+    if audio_embedding is None and payload.audio_data:
+        try:
+            audio_bytes = base64.b64decode(payload.audio_data)
+            audio_embedding = _extract_voice_embedding(audio_bytes)
+            logger.info(
+                "create_user: computed audio embedding (len=%d) for username=%s",
+                len(audio_embedding or []),
+                payload.username,
+            )
+        except Exception as e:
+            logger.exception("create_user: failed to decode audio_data: %s", e)
+
     u = User(
         user_id=uuid4(),
         username=payload.username,
@@ -275,7 +330,7 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         address=payload.address,
         # date_of_birth is accepted as an ISO string; parsing can be added if needed.
         passphrase=payload.passphrase,
-        audio_embedding=payload.audio_embedding,
+        audio_embedding=audio_embedding,
     )
     db.add(u)
     await db.commit()
