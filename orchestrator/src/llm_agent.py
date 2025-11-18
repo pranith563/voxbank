@@ -17,10 +17,13 @@ import os
 import json
 from decimal import Decimal
 
+import httpx
+from pydantic.types import T
 from gemini_llm_client import GeminiLLMClient
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GENAI_API_KEY") or os.environ.get("GEMINI_TOKEN")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+VOX_BANK_BASE_URL = os.environ.get("VOX_BANK_BASE_URL", "http://localhost:9000")
 
 # Set up file-based logging
 try:
@@ -34,6 +37,8 @@ except ImportError:
 
 import math
 from decimal import Decimal
+
+from prompts.vox_assistant import TOOL_SPEC as FALLBACK_TOOL_SPEC, REACT_PROMPT_TEMPLATE, SYSTEM_PROMPT
 
 def _format_amount(self, value, currency="USD"):
     """Return a nicely formatted amount string or None if invalid."""
@@ -127,8 +132,6 @@ class KeywordIntentClassifier:
         confidence = 0.6 if best_intent == "unknown" else 0.9
         return {"intent": best_intent, "entities": entities, "confidence": confidence}
 
-from prompts.vox_assistant import TOOL_SPEC,PROMPT_TEMPLATE, SYSTEM_PROMPT
-
 class LLMAgent:
     """
     Main LLM agent that orchestrates conversations and tool calls.
@@ -154,9 +157,6 @@ class LLMAgent:
         "reminder": ("set_reminder", lambda ent: {"when": ent.get("date") or ent.get("time"), "title": ent.get("title", "reminder")})
     }
     
-    # Map tool names to their expected parameters (for filtering metadata)
-    TOOL_PARAMETERS = {k: set(v["params"].keys()) for k, v in TOOL_SPEC.items()}
-
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
@@ -164,6 +164,7 @@ class LLMAgent:
         llm_client: Optional[Any] = None,
         mcp_client: Optional[Any] = None,
         high_risk_intents: Optional[List[str]] = None,
+        tool_spec: Optional[Dict[str, Any]] = None,
     ):
         self.model_name = model_name
         # Keep intent_classifier as optional fallback, but LLM is primary
@@ -172,18 +173,65 @@ class LLMAgent:
         self.mcp_client = mcp_client  # expected to have `call_tool(tool_name, payload)` async method
         self.conversation_history: Dict[str, List[Dict[str, Any]]] = {}
         self.high_risk_intents = high_risk_intents or ["transfer", "payment", "loan_application"]
-        self.tools_block = self._render_tools_block()
+        # Simple in-memory auth state keyed by session_id
+        # {
+        #   "authenticated": bool,
+        #   "user_id": Optional[str],
+        #   "flow_stage": Optional[str],
+        #   "temp": Dict[str, Any]
+        # }
+        self.auth_state: Dict[str, Dict[str, Any]] = {}
+        self.prompt_template = REACT_PROMPT_TEMPLATE
+        # Dynamic tool spec, primarily sourced from MCP list_tools; falls back to
+        # static TOOL_SPEC from prompts.vox_assistant if not provided.
+        self.tool_spec: Dict[str, Any] = {}
+        self.tool_parameters: Dict[str, set] = {}
+        self.set_tool_spec(tool_spec or FALLBACK_TOOL_SPEC)
         logger.debug("Tools block: %s", self.tools_block)
 
 
-    def _render_tools_block(self) -> str:
-        lines = []
-        for name, meta in TOOL_SPEC.items():
-            params = ", ".join([f"{p} (required)" if p_meta.get("required") else f"{p} (optional)"
-                                for p, p_meta in meta["params"].items()])
-            lines.append(f"- {name}: {meta['description']} Params: {params}")
-        return "\n".join(lines)
-    
+    def set_tool_spec(self, spec: Dict[str, Any]) -> None:
+        """
+        Update the tool specification used for prompts and validation.
+
+        Expected shape (from MCP list_tools):
+          {
+            "tool_name": {
+              "description": "...",
+              "params": {
+                 "param": {"type": "...", "required": bool, ...},
+                 ...
+              },
+              ...
+            },
+            ...
+          }
+        """
+        if not spec:
+            logger.warning("LLMAgent.set_tool_spec called with empty spec; falling back to built-in spec")
+            spec = FALLBACK_TOOL_SPEC
+
+        self.tool_spec = spec
+        # Precompute parameter sets for validation
+        self.tool_parameters = {
+            name: set((meta.get("params") or {}).keys())
+            for name, meta in self.tool_spec.items()
+        }
+
+        # Render tools_block string used inside the LLM prompt
+        lines: List[str] = []
+        for name, meta in self.tool_spec.items():
+            params_meta = meta.get("params", {}) or {}
+            params = ", ".join(
+                f"{p} (required)" if (p_meta or {}).get("required") else f"{p} (optional)"
+                for p, p_meta in params_meta.items()
+            )
+            desc = meta.get("description", "")
+            lines.append(f"- {name}: {desc} Params: {params}")
+        self.tools_block = "\n".join(lines)
+
+        logger.info("LLMAgent tool spec updated with %d tools", len(self.tool_spec))
+
     # helper method to render history for the prompt (keeps prompt size manageable)
     def _render_history_for_prompt(self, session_id: str, max_messages: int = 8) -> str:
         h = self.get_history(session_id) or []
@@ -216,6 +264,182 @@ class LLMAgent:
             return f"{tool_name} -> {str(observation)[:200]}"
         except Exception:
             return f"{tool_name} -> (unserializable observation)"
+
+    # -----------------------
+    # Auth / login helpers
+    # -----------------------
+    def _get_auth_state(self, session_id: str) -> Dict[str, Any]:
+        """
+        Return (and initialize if needed) the authentication state for a session.
+        """
+        if session_id not in self.auth_state:
+            self.auth_state[session_id] = {
+                "authenticated": False,
+                "user_id": None,
+                "flow_stage": None,
+                "temp": {},
+            }
+        return self.auth_state[session_id]
+
+    def is_authenticated(self, session_id: str) -> bool:
+        state = self._get_auth_state(session_id)
+        return True #bool(state.get("authenticated") and state.get("user_id"))
+
+    def get_authenticated_user_id(self, session_id: str) -> Optional[str]:
+        state = self._get_auth_state(session_id)
+        return state.get("user_id") if state.get("authenticated") else None
+
+    async def _find_mock_bank_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        """
+        Deterministic lookup of a user by username using mock-bank API.
+        Uses GET /api/users and filters client-side.
+        """
+        base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+        if not base:
+            logger.warning("VOX_BANK_BASE_URL not configured; cannot validate username")
+            return None
+
+        url = f"{base}/api/users"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, params={"limit": 200})
+                resp.raise_for_status()
+                users = resp.json()
+        except Exception as e:
+            logger.exception("Auth: failed to list users from mock-bank: %s", e)
+            return None
+
+        for u in users or []:
+            if u.get("username") == username:
+                logger.info("Auth: found existing mock-bank user %s -> %s", username, u.get("user_id"))
+                return u
+        logger.info("Auth: username %s not found in mock-bank", username)
+        return None
+
+    async def _handle_auth_flow(self, transcript: str, session_id: str) -> Dict[str, Any]:
+        """
+        Rule-based login/registration dialogue handler.
+        This is deterministic and does NOT call the LLM.
+        """
+        state = self._get_auth_state(session_id)
+        text = (transcript or "").strip()
+        lower = text.lower()
+        stage = state.get("flow_stage") or "await_choice"
+
+        logger.info("AUTH: handling auth flow stage=%s for session=%s", stage, session_id)
+
+        # Stage 1: ask user to choose login or register
+        if stage == "await_choice":
+            if any(kw in lower for kw in ["login", "log in", "sign in"]):
+                state["flow_stage"] = "await_login_username"
+                msg = "Sure, let's get you logged in. Please tell me your username."
+            elif any(kw in lower for kw in ["register", "sign up", "create account", "open account"]):
+                state["flow_stage"] = "await_register_username"
+                msg = "Great, let's create a new account. What username would you like to use?"
+            else:
+                msg = "You're not logged in yet. Please say 'login' to sign in or 'register' to create a new account."
+            self._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "clarify", "message": msg}
+
+        # Stage 2: login - capture username and verify it exists
+        if stage == "await_login_username":
+            # Very simple username extraction: use the last token or the raw text
+            username = text.split()[-1]
+            state["temp"]["username"] = username
+            logger.info("AUTH: login username candidate=%s", username)
+
+            user = await self._find_mock_bank_user_by_username(username)
+            if not user:
+                msg = f"I couldn't find an account for username '{username}'. You can try a different username or say 'register' to create a new one."
+                # Stay in the same stage so user can retry or switch to register
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            # Username exists; ask for passphrase (demo only – no real validation yet)
+            state["flow_stage"] = "await_login_passphrase"
+            state["temp"]["user_record"] = user
+            msg = f"Thanks, {username}. Please provide your passphrase."
+            self._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "clarify", "message": msg}
+
+        # Stage 3: login - check passphrase (demo: accept any non-empty)
+        if stage == "await_login_passphrase":
+            if not text:
+                msg = "I didn't catch your passphrase. Please say it again."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            user = state["temp"].get("user_record") or {}
+            username = state["temp"].get("username") or user.get("username") or "user"
+            user_id = user.get("user_id") or username
+
+            # For now, accept any passphrase but log the event for future tightening.
+            logger.info("AUTH: login success for username=%s user_id=%s (passphrase accepted demo-only)", username, user_id)
+            state["authenticated"] = True
+            state["user_id"] = user_id
+            state["flow_stage"] = None
+            state["temp"] = {}
+
+            msg = f"You're now logged in as {username}. How can I help you with your accounts?"
+            self._append_history(session_id, {"role": "assistant", "text": msg})
+            return {
+                "status": "auth_ok",
+                "message": msg,
+                "authenticated_user_id": user_id,
+            }
+
+        # Stage 4: registration - capture desired username
+        if stage == "await_register_username":
+            username = text.split()[-1]
+            state["temp"]["username"] = username
+            logger.info("AUTH: registration username candidate=%s", username)
+
+            user = await self._find_mock_bank_user_by_username(username)
+            if user:
+                msg = f"The username '{username}' is already taken. Please choose another username."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            # In this prototype we don't have a dedicated mock-bank user creation endpoint.
+            # We still collect a passphrase and treat the session as authenticated
+            # once the user confirms it, so account tools remain gated by this session identity.
+            state["flow_stage"] = "await_register_passphrase"
+            msg = f"Username '{username}' is available. Please choose a passphrase."
+            self._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "clarify", "message": msg}
+
+        # Stage 5: registration - capture passphrase and mark session as logged in
+        if stage == "await_register_passphrase":
+            if not text:
+                msg = "I didn't catch your passphrase. Please say it again."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            username = state["temp"].get("username") or "user"
+            # For now we simulate user creation; future work can call a mock-bank user-create API.
+            user_id = username
+            logger.info("AUTH: registration success for username=%s (simulated user_id=%s)", username, user_id)
+
+            state["authenticated"] = True
+            state["user_id"] = user_id
+            state["flow_stage"] = None
+            state["temp"] = {}
+
+            msg = f"Welcome, {username}! Your VoxBank profile is ready and you're now logged in."
+            self._append_history(session_id, {"role": "assistant", "text": msg})
+            return {
+                "status": "auth_ok",
+                "message": msg,
+                "authenticated_user_id": user_id,
+            }
+
+        # Fallback: reset auth flow if stage unknown
+        logger.warning("AUTH: unknown auth flow stage '%s' for session=%s; resetting", stage, session_id)
+        state["flow_stage"] = "await_choice"
+        state["temp"] = {}
+        msg = "You're not logged in yet. Would you like to login or register?"
+        self._append_history(session_id, {"role": "assistant", "text": msg})
+        return {"status": "clarify", "message": msg}
     
     def _is_raw_tool_output(self, text: str) -> bool:
         if not text or len(text) < 20:
@@ -242,7 +466,7 @@ class LLMAgent:
         logger.info("Context: %s | Transcript: %s", context, transcript)
         
         # add context/history to the prompt, tools_block too
-        prompt = PROMPT_TEMPLATE.replace("{history}",context).replace("{tools_block}", self.tools_block).strip()
+        prompt = self.prompt_template.replace("{history}", context).replace("{tools_block}", self.tools_block).strip()
 
         # Add the user request at the end
         prompt = f"{prompt}\n\nUser request: \"{transcript}\"\n"
@@ -263,6 +487,7 @@ class LLMAgent:
         # call llm
         raw = await self.call_llm(prompt, max_tokens=max_tokens)
         logger.info("LLM raw response received (length: %d chars)", len(raw))
+        logger.info("\n LLM raw resposne: %s\n", raw)
         logger.debug("LLM raw response: %s", raw[:500] + "..." if len(raw) > 500 else raw)
         # Extract JSON
         try:
@@ -323,7 +548,7 @@ class LLMAgent:
             logger.info("Validating tool call: %s", tool)
             logger.debug("Tool input before validation: %s", parsed["tool_input"])
             
-            if tool not in self.TOOL_PARAMETERS:
+            if tool not in self.tool_parameters:
                 logger.warning("Invalid tool requested: %s (not in TOOL_PARAMETERS)", tool)
                 # invalid tool => ask user
                 return {
@@ -337,12 +562,18 @@ class LLMAgent:
                 }
             
             # filter tool_input keys and ensure required params present
-            expected = self.TOOL_PARAMETERS.get(tool, set())
+            expected = self.tool_parameters.get(tool, set())
             logger.debug("Expected parameters for %s: %s", tool, expected)
             filtered = {k: v for k, v in parsed["tool_input"].items() if k in expected}
             logger.debug("Filtered tool input: %s", filtered)
             
-            missing = [p for p in expected if p not in filtered and TOOL_SPEC[tool]["params"][p].get("required")]
+            # Use dynamic spec first; fall back to built-in spec if needed
+            base_spec = (self.tool_spec.get(tool) or FALLBACK_TOOL_SPEC.get(tool) or {})
+            param_spec = base_spec.get("params", {}) or {}
+            missing = [
+                p for p in expected
+                if p not in filtered and (param_spec.get(p) or {}).get("required")
+            ]
             if missing:
                 logger.warning("Missing required parameters for %s: %s", tool, missing)
                 # ask for missing params
@@ -362,28 +593,6 @@ class LLMAgent:
         logger.info("=" * 80)
         return parsed
 
-    async def process_user_input(self, transcript: str, session_id: str) -> Dict[str, Any]:
-        """
-        Process user input using LLM to determine intent and required actions.
-        This is a compatibility method that uses the LLM-based parser.
-        Returns a dict with keys:
-         - intent, entities, confidence, requires_tool (bool), tool_name (opt), tool_input (opt),
-           confirmation_required (bool)
-        """
-        # Use LLM-based decision parsing
-        parsed = await self.decision(transcript, session_id)
-        # Convert to expected format for backward compatibility
-        result = {
-            "intent": parsed.get("intent", "unknown"),
-            "entities": parsed.get("tool_input", {}),  # Use tool_input as entities
-            "confidence": 0.9 if parsed.get("requires_tool") else 0.7,
-            "requires_tool": parsed.get("requires_tool", False),
-            "tool_name": parsed.get("tool_name"),
-            "tool_input": parsed.get("tool_input", {}),
-            "confirmation_required": parsed.get("requires_confirmation", False),
-        }
-        return result
-
     async def orchestrate(self, transcript: str, session_id: str, user_confirmation: Optional[bool] = None, reply_style: Optional[str] = "concise", parse_only: bool = False, max_iterations: int = 4) -> Dict[str, Any]:
         """
         ReAct style orchestration loop:
@@ -396,9 +605,17 @@ class LLMAgent:
         logger.info("Session: %s | Transcript: %s", session_id, transcript)
         logger.info("User confirmation: %s | Parse only: %s | Reply style: %s", user_confirmation, parse_only, reply_style)
 
-        # Ensure user message added to history first so decision sees it
-        self._append_history(session_id, {"role": "user", "text": transcript})
-        logger.debug("Added user message to history")
+        
+        
+
+        # If we are currently in a login / registration flow, handle it
+        auth_state = self._get_auth_state(session_id)
+        if auth_state.get("flow_stage"):
+            logger.info("ORCHESTRATE: routing input to auth flow (stage=%s)", auth_state.get("flow_stage"))
+            result = await self._handle_auth_flow(transcript, session_id)
+            logger.info("ORCHESTRATE: auth flow handled with status=%s", result.get("status"))
+            logger.info("=" * 80)
+            return result
 
         iterations = 0
         parsed = None
@@ -413,7 +630,8 @@ class LLMAgent:
 
             # Call decision with current transcript + context and last observation (if any)
             parsed = await self.decision(transcript, self._render_history_for_prompt(session_id), observation=observation)
-
+            self._append_history(session_id, {"role": "user", "text": transcript})
+            logger.debug("Added user message to history")
             action = parsed.get("action")
             intent = parsed.get("intent")
             requires_tool = parsed.get("requires_tool", False)
@@ -444,6 +662,7 @@ class LLMAgent:
                     # if tool_result present and assistant_response mentions data, polish
                     should_polish = True
 
+                should_polish = False
                 if should_polish:
                     logger.info("Polishing assistant response via generate_response_llm_first()")
                     # pass intent, parsed tool_input/entities and tool_result (if any) so LLM can craft final text
@@ -467,9 +686,22 @@ class LLMAgent:
                 logger.info("ORCHESTRATE - Complete (respond)")
                 return {"status": "ok", "response": final_reply}
 
-            # If decision says call_tool -> execute tool, capture observation and loop again
+            # If decision says call_tool -> enforce login for account tools, then execute tool
             if action == "call_tool" and requires_tool and tool_name:
                 logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
+
+                # Gate account-specific tools behind login/registration
+                if not parse_only and tool_name in ("balance", "transactions", "transfer") and not self.is_authenticated(session_id):
+                    logger.info("AUTH: session %s not authenticated; prompting for login/registration before tool %s", session_id, tool_name)
+                    # Start auth flow if not already started
+                    state = self._get_auth_state(session_id)
+                    if not state.get("flow_stage"):
+                        state["flow_stage"] = "await_choice"
+                    msg = "You're not logged in yet. Would you like to login or register?"
+                    self._append_history(session_id, {"role": "assistant", "text": msg})
+                    logger.info("ORCHESTRATE - Completed (auth_required before tool exec) at iter %d", iterations)
+                    logger.info("=" * 80)
+                    return {"status": "clarify", "message": msg, "parsed": parsed}
 
                 # Enforce confirmation for high-risk actions
                 if requires_confirmation and not user_confirmation:
