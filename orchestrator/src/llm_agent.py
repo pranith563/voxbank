@@ -283,7 +283,7 @@ class LLMAgent:
 
     def is_authenticated(self, session_id: str) -> bool:
         state = self._get_auth_state(session_id)
-        return True #bool(state.get("authenticated") and state.get("user_id"))
+        return bool(state.get("authenticated") and state.get("user_id"))
 
     def get_authenticated_user_id(self, session_id: str) -> Optional[str]:
         state = self._get_auth_state(session_id)

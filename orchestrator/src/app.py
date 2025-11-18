@@ -33,6 +33,7 @@ from voice_processing import (
     transcribe_audio_to_text,
     synthesize_text_to_audio,
     audio_bytes_to_data_url,
+    extract_voice_embedding,
 )
 
 
@@ -70,6 +71,22 @@ class VoiceResponse(BaseModel):
     session_id: str
     requires_confirmation: bool = False
     meta: Optional[Dict[str, Any]] = None
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    passphrase: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    address: Optional[str] = None
+    date_of_birth: Optional[str] = None  # ISO date string (not used by mock-bank today)
+    audio_data: Optional[str] = None  # base64-encoded audio for embedding
+
+
+class RegisterResponse(BaseModel):
+    status: str
+    user: Dict[str, Any]
 
 
 # FastAPI app
@@ -189,6 +206,61 @@ async def root():
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.post("/api/auth/register", response_model=RegisterResponse)
+async def register_user(request: RegisterRequest):
+    """
+    Register a new VoxBank user.
+
+    - Optionally accepts `audio_data` (base64) and extracts a voice embedding.
+    - Calls MCP tool `register_user` to create the user in mock-bank.
+    """
+    logger.info("API Request: POST /api/auth/register | username=%s", request.username)
+
+    # Prepare audio embedding if audio_data is provided
+    audio_embedding = None
+    if request.audio_data:
+        try:
+            import base64
+
+            audio_bytes = base64.b64decode(request.audio_data)
+            audio_embedding = await extract_voice_embedding(audio_bytes)
+            logger.info(
+                "Register: extracted voice embedding (len=%d) for username=%s",
+                len(audio_embedding or []),
+                request.username,
+            )
+        except Exception as e:
+            logger.exception("Register: failed to extract voice embedding: %s", e)
+
+    # Build payload for MCP register_user tool
+    payload: Dict[str, Any] = {
+        "username": request.username,
+        "passphrase": request.passphrase,
+        "email": request.email,
+        "full_name": request.full_name,
+        "phone_number": request.phone_number,
+        "audio_embedding": audio_embedding,
+    }
+
+    try:
+        mcp_client: MCPClient = app.state.mcp_client
+        logger.info("Register: calling MCP register_user for username=%s", request.username)
+        result = await mcp_client.call_tool("register_user", payload)
+        logger.info("Register: MCP register_user result status=%s", result.get("status"))
+
+        if result.get("status") != "success":
+            msg = result.get("message") or "Registration failed"
+            raise HTTPException(status_code=400, detail=msg)
+
+        user = result.get("user") or {}
+        return RegisterResponse(status="success", user=user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in /api/auth/register: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # WebSocket contract (voice/text streaming)

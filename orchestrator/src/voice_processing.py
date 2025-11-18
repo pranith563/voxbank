@@ -83,6 +83,7 @@ async def extract_voice_embedding(audio_bytes: bytes) -> Optional[list[float]]:
     return None
 
   logger.info("VOICE AUTH: extract_voice_embedding stub called (len=%d bytes)", len(audio_bytes))
-  # Placeholder: return a dummy small vector
-  return [0.0, 0.0, 0.0]
-
+  # Placeholder: return a deterministic dummy vector based on length only.
+  # Real implementation should call a speaker embedding model.
+  length = float(len(audio_bytes))
+  return [length, 0.0, 0.0]
