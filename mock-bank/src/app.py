@@ -132,6 +132,21 @@ def _serialize_tx(t: Transaction) -> dict:
         "created_at": t.created_at.isoformat() if t.created_at else None
     }
 
+
+from db import session as db_session_module
+logger.info("Effective DATABASE_URL: %s", getattr(db_session_module, "DATABASE_URL", os.environ.get("DATABASE_URL")))
+
+# simple request logging middleware (fast)
+from starlette.requests import Request
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    try:
+        body = await request.body()
+        logger.info("HTTP %s %s from %s body=%s", request.method, request.url.path, request.client.host if request.client else "?", body.decode(errors="ignore")[:100])
+    except Exception:
+        logger.exception("Failed to read request body for logging")
+    response = await call_next(request)
+    return response
 # --------------------
 # Routes
 # --------------------
@@ -165,12 +180,24 @@ async def get_user_accounts(user_id: UUID, db=Depends(get_db)):
 
 @app.get("/api/accounts/{account_number}", response_model=AccountOut)
 async def get_account(account_number: str, db=Depends(get_db)):
-    stmt = select(Account).where(Account.account_number == account_number)
+    acct_num = account_number.strip()
+    logger.info("Lookup account_number=%s (raw=%s)", acct_num, account_number)
+    stmt = select(Account).where(Account.account_number == acct_num)
     res = await db.execute(stmt)
     a = res.scalars().first()
     if not a:
+        # useful debug: log count check
+        try:
+            count_stmt = select(func.count()).select_from(Account).where(Account.account_number == acct_num)
+            cnt_res = await db.execute(count_stmt)
+            cnt = cnt_res.scalar_one()
+        except Exception as ex:
+            logger.exception("Error counting account rows: %s", ex)
+            cnt = "error"
+        logger.warning("Account not found: %s (count=%s)", acct_num, cnt)
         raise HTTPException(status_code=404, detail="Account not found")
     return _serialize_account(a)
+
 
 @app.get("/api/accounts/{account_number}/transactions", response_model=List[TransactionOut])
 async def get_account_transactions(account_number: str, limit: int = 20, db=Depends(get_db)):
