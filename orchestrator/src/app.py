@@ -283,7 +283,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
         session["history"].append({"role": "assistant", "text": response_text})
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
-        return TextResponse(response_text=response_text, session_id=session_id, requires_confirmation=False, meta={"tool_result": out.get("tool_result")})
+        return TextResponse(response_text=response_text, session_id=session_id, requires_confirmation=False)
 
     except Exception as e:
         logger.exception("Error in process_text: %s", e)

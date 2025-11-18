@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GENAI_API_KEY") or os.environ.get("GEMINI_TOKEN")
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Try to import the google-genai SDK
 from google import genai  # type: ignore
@@ -94,10 +94,10 @@ class GeminiLLMClient:
                 return "Sorry, I'm having trouble generating a response."
 
 # Example usage snippet (async)
-# async def _quick_demo():
-#     client = GeminiLLMClient()
-#     out = await client.generate("You are a friendly assistant. Tell me a love quote", max_tokens=200)
-#     print("Gemini says:", out)
+async def _quick_demo():
+    client = GeminiLLMClient()
+    out = await client.generate("You are a friendly assistant. Tell me a love quote", max_tokens=200)
+    print("Gemini says:", out)
 
-# if __name__ == "__main__":
-#     asyncio.run(_quick_demo())
+if __name__ == "__main__":
+    asyncio.run(_quick_demo())

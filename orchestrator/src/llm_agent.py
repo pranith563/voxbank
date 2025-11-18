@@ -127,7 +127,7 @@ class KeywordIntentClassifier:
         confidence = 0.6 if best_intent == "unknown" else 0.9
         return {"intent": best_intent, "entities": entities, "confidence": confidence}
 
-from prompts.vox_assistant import TOOL_SPEC,PROMPT_TEMPLATE
+from prompts.vox_assistant import TOOL_SPEC,PROMPT_TEMPLATE, SYSTEM_PROMPT
 
 class LLMAgent:
     """
@@ -172,7 +172,10 @@ class LLMAgent:
         self.mcp_client = mcp_client  # expected to have `call_tool(tool_name, payload)` async method
         self.conversation_history: Dict[str, List[Dict[str, Any]]] = {}
         self.high_risk_intents = high_risk_intents or ["transfer", "payment", "loan_application"]
-    
+        self.tools_block = self._render_tools_block()
+        logger.debug("Tools block: %s", self.tools_block)
+
+
     def _render_tools_block(self) -> str:
         lines = []
         for name, meta in TOOL_SPEC.items():
@@ -181,34 +184,79 @@ class LLMAgent:
             lines.append(f"- {name}: {meta['description']} Params: {params}")
         return "\n".join(lines)
     
-    async def _llm_act_decision(self, transcript: str, session_id: str, max_tokens: int = 512) -> dict:
+    # helper method to render history for the prompt (keeps prompt size manageable)
+    def _render_history_for_prompt(self, session_id: str, max_messages: int = 8) -> str:
+        h = self.get_history(session_id) or []
+        if not h:
+            return ""
+        recent = h[-max_messages:]
+        lines = []
+        for m in recent:
+            role = m.get("role", "user")
+            text = m.get("text", "")
+            lines.append(f"{role}: {text}")
+        return "\n".join(lines)
+    
+    # helper to format observation stored in history (short summary)
+    def _format_observation_for_history(self, tool_name: str, observation: Any) -> str:
+        try:
+            if isinstance(observation, dict):
+                # keep brief keys: status, message, balance, transactions count
+                if "balance" in observation:
+                    return f"{tool_name} -> balance: {observation.get('balance')} {observation.get('currency', '')}"
+                if "transactions" in observation and isinstance(observation.get("transactions"), list):
+                    return f"{tool_name} -> returned {len(observation.get('transactions'))} transactions"
+                if "status" in observation and observation.get("status") != "success":
+                    return f"{tool_name} -> status: {observation.get('status')} - {str(observation.get('message',''))}"
+                # fallback to short json snippet
+                short = json.dumps(observation, default=str)
+                return f"{tool_name} -> {short[:200]}"
+            if isinstance(observation, list):
+                return f"{tool_name} -> list length {len(observation)}"
+            return f"{tool_name} -> {str(observation)[:200]}"
+        except Exception:
+            return f"{tool_name} -> (unserializable observation)"
+    
+    def _is_raw_tool_output(self, text: str) -> bool:
+        if not text or len(text) < 20:
+            return False
+        # heuristics
+        if re.search(r"\btransactions?\b", text, flags=re.I):
+            return True
+        if re.search(r"\bACC[0-9A-Za-z]{3,}\b", text):
+            return True
+        if re.search(r"^\s*[-\u2022]\s+", text, flags=re.M):  # bullet lines
+            return True
+        if re.search(r"\[.*?\]|\{.*?\}", text):
+            return True
+        return False
+
+    async def decision(self, transcript: str, context: str, observation: Optional[Any] = None, max_tokens: int = 512) -> dict:
         """
         Ask the LLM to *decide* action: respond, call_tool, ask_user, or ask_confirmation.
         Returns parsed JSON dict with keys: action, intent, requires_tool, tool_name, tool_input,
         requires_confirmation, response
         """
         logger.info("=" * 80)
-        logger.info("LLM ACT DECISION - Starting")
-        logger.info("Session: %s | Transcript: %s", session_id, transcript)
+        logger.info("LLM DECISION - Starting")
+        logger.info("Context: %s | Transcript: %s", context, transcript)
         
-        # include recent history for context (last few messages)
-        history = self.get_history(session_id) or []
-        logger.debug("History length: %d messages", len(history))
-        
-        history_context = ""
-        if history:
-            last = history[-6:]  # last up to 6 messages
-            history_context = "\nConversation context:\n" + "\n".join([f"{m['role']}: {m['text']}" for m in last]) + "\n\n"
-            logger.debug("History context: %s", history_context[:200] + "..." if len(history_context) > 200 else history_context)
+        # add context/history to the prompt, tools_block too
+        prompt = PROMPT_TEMPLATE.replace("{history}",context).replace("{tools_block}", self.tools_block).strip()
 
-        tools_block = self._render_tools_block()
-        logger.debug("Tools block: %s", tools_block)
-        
-        # Use replace instead of format to avoid issues with JSON braces in template
-        prompt = (history_context + PROMPT_TEMPLATE.replace("{tools_block}", tools_block)).strip()
         # Add the user request at the end
-        prompt = f"{prompt}\n\nUser request: \"{transcript}\"\n\nReturn JSON now."
+        prompt = f"{prompt}\n\nUser request: \"{transcript}\"\n"
         
+        logger.info("LLM FULL PROMPT: %s",prompt)
+        # If observation present, append observation JSON for LLM to reason about
+        if observation is not None:
+            try:
+                obs_json = json.dumps(observation, default=str)
+            except Exception:
+                obs_json = str(observation)
+            prompt += f"\nObservation (from tool): {obs_json}\n"
+
+        prompt += "\nReturn JSON now."
         logger.info("Calling LLM with prompt (length: %d chars)", len(prompt))
         logger.debug("Full prompt: %s", prompt[:500] + "..." if len(prompt) > 500 else prompt)
 
@@ -310,7 +358,7 @@ class LLMAgent:
             parsed["tool_input"] = filtered
             logger.info("✓ Tool validation passed: %s with input %s", tool, filtered)
 
-        logger.info("LLM ACT DECISION - Complete")
+        logger.info("LLM DECISION - Complete")
         logger.info("=" * 80)
         return parsed
 
@@ -323,7 +371,7 @@ class LLMAgent:
            confirmation_required (bool)
         """
         # Use LLM-based decision parsing
-        parsed = await self._llm_act_decision(transcript, session_id)
+        parsed = await self.decision(transcript, session_id)
         # Convert to expected format for backward compatibility
         result = {
             "intent": parsed.get("intent", "unknown"),
@@ -336,166 +384,235 @@ class LLMAgent:
         }
         return result
 
-    async def orchestrate(self, transcript: str, session_id: str, user_confirmation: Optional[bool] = None, reply_style: Optional[str] = "concise", parse_only: bool = False) -> Dict[str, Any]:
+    async def orchestrate(self, transcript: str, session_id: str, user_confirmation: Optional[bool] = None, reply_style: Optional[str] = "concise", parse_only: bool = False, max_iterations: int = 4) -> Dict[str, Any]:
         """
-        High-level orchestration method using LLM for intent classification:
-         - Uses LLM to extract intent and entities from user input
-         - Determines which tool to call (if any)
-         - If confirmation required, returns needs_confirmation unless user_confirmation=True
-         - Calls MCP tool (via mcp_client) if needed
-         - Generates final response via LLM
+        ReAct style orchestration loop:
+        - call decision()
+        - if decision -> call_tool: execute tool, append observation, call decision() again
+        - otherwise handle respond / ask_user / ask_confirmation
         """
         logger.info("=" * 80)
-        logger.info("ORCHESTRATE - Starting")
+        logger.info("ORCHESTRATE (ReAct) - Starting")
         logger.info("Session: %s | Transcript: %s", session_id, transcript)
         logger.info("User confirmation: %s | Parse only: %s | Reply style: %s", user_confirmation, parse_only, reply_style)
-        
-        # Maintain history
+
+        # Ensure user message added to history first so decision sees it
         self._append_history(session_id, {"role": "user", "text": transcript})
         logger.debug("Added user message to history")
 
-        # Use LLM to extract intent, entities, and determine tool requirements
-        logger.info("Calling _llm_act_decision()...")
-        parsed = await self._llm_act_decision(transcript, session_id)
-        
-        action = parsed.get("action")
-        intent = parsed.get("intent")
-        requires_tool = parsed.get("requires_tool", False)
-        tool_name = parsed.get("tool_name")
-        tool_input = parsed.get("tool_input", {})
-        requires_confirmation = parsed.get("requires_confirmation", False)
-        assistant_response = parsed.get("response", "")
-        
-        logger.info("LLM Decision Summary:")
-        logger.info("  Action: %s", action)
-        logger.info("  Intent: %s", intent)
-        logger.info("  Requires Tool: %s", requires_tool)
-        logger.info("  Tool Name: %s", tool_name)
-        logger.info("  Tool Input: %s", tool_input)
-        logger.info("  Requires Confirmation: %s", requires_confirmation)
-        logger.info("  Assistant Response: %s", assistant_response[:100] + "..." if len(assistant_response) > 100 else assistant_response)
-
-        # If the LLM wants to ask user (clarify or confirm) -> return needs_confirmation or ask
-        if action in ("ask_user", "ask_confirmation"):
-            logger.info("LLM requested to ask user (action=%s)", action)
-            # append assistant text to history and return
-            self._append_history(session_id, {"role": "assistant", "text": assistant_response})
-            status = "needs_confirmation" if action == "ask_confirmation" else "clarify"
-            logger.info("Returning status=%s with message: %s", status, assistant_response)
-            logger.info("ORCHESTRATE - Complete (ask_user/ask_confirmation)")
-            logger.info("=" * 80)
-            return {"status": status, "message": assistant_response, "parsed": parsed}
-
-        # If the LLM decided to call a tool
+        iterations = 0
+        parsed = None
         tool_result = None
-        if action == "call_tool" and requires_tool and tool_name:
-            logger.info("Tool execution required: %s", tool_name)
-            
-            if requires_confirmation and not user_confirmation:
-                logger.info("Tool requires confirmation but user_confirmation=False")
-                # ask for explicit confirmation in orchestrate layer
-                confirm_msg = f"I will perform: {intent}. {assistant_response or 'Do you want to proceed?'}"
-                logger.info("Asking for confirmation: %s", confirm_msg)
-                self._append_history(session_id, {"role": "assistant", "text": confirm_msg})
-                logger.info("ORCHESTRATE - Complete (needs_confirmation)")
+
+        # observation is the last tool output passed back into decision
+        observation = None
+
+        while iterations < max_iterations:
+            iterations += 1
+            logger.info("ReAct loop iteration %d/%d", iterations, max_iterations)
+
+            # Call decision with current transcript + context and last observation (if any)
+            parsed = await self.decision(transcript, self._render_history_for_prompt(session_id), observation=observation)
+
+            action = parsed.get("action")
+            intent = parsed.get("intent")
+            requires_tool = parsed.get("requires_tool", False)
+            tool_name = parsed.get("tool_name")
+            tool_input = parsed.get("tool_input", {})
+            requires_confirmation = parsed.get("requires_confirmation", False)
+            assistant_response = parsed.get("response", "")
+
+            logger.info("Decision (iter %d): action=%s intent=%s tool=%s requires_confirmation=%s", iterations, action, intent, tool_name, requires_confirmation)
+            logger.debug("Parsed: %s", parsed)
+
+            # If decision requests to ask user / confirm -> return immediately (assistant message already prepared)
+            if action in ("ask_user", "ask_confirmation"):
+                # append assistant text to history for continuity
+                self._append_history(session_id, {"role": "assistant", "text": assistant_response})
+                status = "needs_confirmation" if action == "ask_confirmation" else "clarify"
+                logger.info("ORCHESTRATE - Completed (ask_user/ask_confirmation) at iter %d", iterations)
                 logger.info("=" * 80)
-                return {"status": "needs_confirmation", "message": confirm_msg, "parsed": parsed}
-            
-            if not self.mcp_client:
-                logger.error("MCP client not configured - cannot execute tool")
-                tool_result = {"status": "not_configured", "message": "MCP client not set up."}
-            else:
-                try:
-                    # filtered_input already performed in _llm_act_decision
-                    logger.info("=" * 60)
-                    logger.info("EXECUTING MCP TOOL")
-                    logger.info("Tool: %s", tool_name)
-                    logger.info("Input: %s", tool_input)
-                    logger.info("=" * 60)
-                    
-                    tool_result = await self.mcp_client.call_tool(tool_name, tool_input)
-                    
-                    logger.info("=" * 60)
-                    logger.info("MCP TOOL RESULT")
-                    logger.info("Tool: %s", tool_name)
-                    logger.info("Result: %s", tool_result)
-                    logger.info("=" * 60)
-                except Exception as e:
-                    logger.exception("Error executing MCP tool %s: %s", tool_name, e)
-                    logger.error("Tool input was: %s", tool_input)
-                    tool_result = {"status": "error", "message": str(e)}
+                return {"status": status, "message": assistant_response}
 
-        # If action == "respond" just use assistant_response
-        if action == "respond" and assistant_response:
-            logger.info("Using LLM-provided response (action=respond)")
-            self._append_history(session_id, {"role": "assistant", "text": assistant_response})
-            logger.info("ORCHESTRATE - Complete (respond)")
-            logger.info("=" * 80)
-            return {"status": "ok", "response": assistant_response, "tool_result": tool_result, "parsed": parsed}
+            # If decision says respond -> append to history and return final response
+            if action == "respond" and assistant_response:
+                logger.info("Using LLM-provided response (action=respond) — checking if polishing needed")
+                # If the response looks like raw tool output or is long/multi-line, polish it.
+                should_polish = self._is_raw_tool_output(assistant_response)
+                # Also polish if we have a tool_result/observation present (from previous loop)
+                if not should_polish and (tool_result is not None or parsed.get("tool_input")):
+                    # if tool_result present and assistant_response mentions data, polish
+                    should_polish = True
 
-        # Otherwise, we still have to synthesize a response (maybe include tool_result)
-        logger.info("Generating response via generate_response()...")
-        logger.debug("Intent: %s, Entities: %s, Tool result: %s", intent, parsed.get("tool_input", {}), tool_result)
-        response_text = await self.generate_response_llm_first(intent, parsed.get("tool_input", {}), tool_result)
-        logger.info("Generated response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
+                if should_polish:
+                    logger.info("Polishing assistant response via generate_response_llm_first()")
+                    # pass intent, parsed tool_input/entities and tool_result (if any) so LLM can craft final text
+                    try:
+                        polished = await self.generate_response(
+                            intent or "unknown",
+                            parsed.get("tool_input", {}),
+                            tool_result or parsed.get("tool_output") or parsed.get("observation"),
+                            reply_style=reply_style
+                        )
+                        # fallback to assistant_response if polishing fails
+                        final_reply = polished or assistant_response
+                    except Exception as e:
+                        logger.exception("Polishing failed: %s. Falling back to raw assistant_response", e)
+                        final_reply = assistant_response
+                else:
+                    final_reply = assistant_response
+
+                # Append final reply and return
+                self._append_history(session_id, {"role": "assistant", "text": final_reply})
+                logger.info("ORCHESTRATE - Complete (respond)")
+                return {"status": "ok", "response": final_reply}
+
+            # If decision says call_tool -> execute tool, capture observation and loop again
+            if action == "call_tool" and requires_tool and tool_name:
+                logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
+
+                # Enforce confirmation for high-risk actions
+                if requires_confirmation and not user_confirmation:
+                    confirm_msg = f"I will perform: {intent}. {assistant_response or 'Do you want to proceed?'}"
+                    # Do not execute; ask user for confirmation
+                    self._append_history(session_id, {"role": "assistant", "text": confirm_msg})
+                    logger.info("ORCHESTRATE - Completed (needs_confirmation before tool exec) at iter %d", iterations)
+                    logger.info("=" * 80)
+                    return {"status": "needs_confirmation", "message": confirm_msg}
+
+                # ensure mcp_client present
+                if not self.mcp_client:
+                    logger.error("MCP client not configured - cannot execute tool")
+                    observation = {"status": "not_configured", "message": "MCP client not set up."}
+                else:
+                    try:
+                        logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, tool_input)
+                        tool_result = await self.mcp_client.call_tool(tool_name, tool_input)
+                        logger.info("Tool result: %s", tool_result)
+                        # Normalize observation to dict or list
+                        if isinstance(tool_result, (dict, list)):
+                            observation = tool_result
+                        else:
+                            # non-serializable -> stringify minimally
+                            observation = {"status": "ok", "result": str(tool_result)}
+                    except Exception as e:
+                        logger.exception("Exception while executing tool %s: %s", tool_name, e)
+                        observation = {"status": "error", "message": str(e)}
+
+                # append a short tool observation into history as a tool message and continue loop
+                obs_summary = self._format_observation_for_history(tool_name, observation)
+                self._append_history(session_id, {"role": "tool", "text": obs_summary, "detail": observation})
+                logger.info("Appended tool observation to history and continuing loop (iter %d)", iterations)
+                # continue to next iteration so decision() can see observation and decide next action
+                continue
+
+            # If none of the above matched, break
+            logger.warning("Decision returned unexpected action or no-op; breaking loop (iter %d): %s", iterations, parsed)
+            break
+
+        # Reached end of loop: either no decision or max iterations hit
+        logger.info("Exited ReAct loop after %d iterations", iterations)
+
+        # If we have a tool_result (observation), let generate_response combine it into final reply
+        response_text = None
+        try:
+            response_text = await self.generate_response(intent or "unknown", parsed.get("tool_input", {}), observation)
+        except Exception as e:
+            logger.exception("Error generating final response: %s", e)
+            response_text = parsed.get("response") or "Sorry, I'm having trouble right now."
+
+        # Append assistant reply to history and return
         self._append_history(session_id, {"role": "assistant", "text": response_text})
-        logger.info("ORCHESTRATE - Complete")
+        logger.info("ORCHESTRATE - Complete (final response)")
         logger.info("=" * 80)
-        return {"status": "ok", "response": response_text, "tool_result": tool_result, "parsed": parsed}
+        return {"status": "ok", "response": response_text}
 
-    async def generate_response_llm_first(self, intent: str, entities: Dict[str, Any], tool_result: Optional[Any] = None, reply_style: str = "concise") -> str:
-    # Build context JSON for the LLM
+
+    async def generate_response(
+        self,
+        intent: str,
+        entities: Dict[str, Any],
+        tool_result: Optional[Any] = None,
+        reply_style: str = "concise",
+        max_tokens: int = 150,
+        temperature: float = 0.0
+    ) -> str:
+        """
+        LLM-first response generator.
+        The LLM is given a compact JSON context and expected to return 1-2 polite sentences.
+        This wrapper sanitizes the LLM output and falls back to deterministic summaries when needed.
+        """
+
+        # Build context JSON for the LLM
         context = {
             "intent": intent,
             "entities": entities or {},
             "tool_result": tool_result if tool_result is not None else {}
         }
-        system_user_prompt = """SYSTEM: You are VoxBank's assistant. Your job is to produce a single short user-facing sentence or two based only on the provided JSON context. Do NOT invent, guess, or ask follow-up questions unless required input is missing. If required input is missing, return a single short clarifying question asking explicitly for the missing field(s) only.
 
-    Rules:
-    - Use only the values present in the JSON. Do not add new numbers, account ids, names, or dates.
-    - Mask account numbers in the text (e.g. "ACC****9001" or "primary"). If the JSON contains an account field labelled "account_number" unmasked, display it masked.
-    - Do not use square-bracket placeholders like [Balance Amount]. If a value is missing, ask for it (see above).
-    - Keep the reply concise (1-2 sentences). Use polite, human tone.
-    - For transactions: summarize most recent transaction(s) with amount, direction (debit/credit), short description/merchant, and status. Do not ask meta questions (e.g., "When was this created?") unless the user specifically asked for that field and it's missing from the data.
-    - For failures: state the failure briefly and, if helpful, a single actionable next step.
-    - For transfers or high-risk actions: include the transaction reference/id if present, and do not indicate success unless the tool_result clearly shows status == "success".
-    - If tool_result is empty or not a dict/list, respond: "I couldn't retrieve the information right now. Would you like me to try again?"
 
-    USER CONTEXT (JSON):
-    {context_json}
+        # Safely insert the context JSON (avoid .format interpreting braces)
+        context_json = json.dumps(context, default=str)
+        prompt = SYSTEM_PROMPT.replace("{context_json}", context_json)
 
-    Return only the reply text (no JSON, no explanations).
-    """
-        prompt = system_user_prompt.format(context_json=json.dumps(context, default=str))
+        # Call LLM - prefer passing temperature if call_llm supports it.
+        try:
+            # try to pass temperature if call_llm accepts it
+            raw = await self.call_llm(prompt, max_tokens=max_tokens, temperature=temperature)
+        except TypeError:
+            # fallback: older call_llm without temperature parameter
+            raw = await self.call_llm(prompt, max_tokens=max_tokens)
 
-        # Call LLM with deterministic settings; update call_llm to accept temperature param if available
-        raw = await self.call_llm(prompt, max_tokens=150)  # ensure call_llm uses low temperature (0) in the LLM client
+        raw = (raw or "").strip()
+        logger.debug("LLM reply (raw): %s", raw[:1000])
 
-        # Basic sanitation: remove extra whitespace, and ensure it doesn't ask an unrelated meta question
-        reply = raw.strip()
-        # If LLM produced a meta question asking about creation time without user asking, fallback to deterministic summary:
-        if re.search(r"\bWhen was this\b|\bWhen did\b|\bHow long ago\b", reply, flags=re.I):
-            # fallback: produce deterministic summary using available fields
-            if isinstance(tool_result, dict):
-                # attempt to build a concise transaction summary
-                txs = tool_result.get("transactions") or (tool_result if isinstance(tool_result, list) else None)
-                if isinstance(txs, list) and len(txs) > 0:
-                    t = txs[0]
-                    amt = t.get("amount") or t.get("value")
-                    cur = t.get("currency") or t.get("currency_code") or ""
-                    direction = "debit" if t.get("type") == "debit" or float(amt) < 0 else "credit"
-                    desc = t.get("description") or t.get("merchant") or t.get("narration") or "a transaction"
-                    acct = self._mask_account(t.get("account") or entities.get("account_number") or tool_result.get("account_number"))
-                    amt_str = self._format_amount(amt, cur or "")
-                    if amt_str:
-                        return f"Your most recent transaction for {acct} was a completed {direction} of {amt_str} for '{desc}'."
-            # otherwise return a generic safe message
-            return "I couldn't determine the full transaction details. Would you like me to fetch more details?"
+        # Basic sanitation: if empty or appears to contain placeholders or a meta question -> fallback
+        if not raw:
+            logger.warning("LLM returned empty reply; falling back to deterministic summary.")
+            return self._deterministic_fallback(intent, entities, tool_result)
 
-        # Ensure we don't return bracket placeholders etc.
-        if re.search(r"\[.*?\]|\{.*?\}", reply):
-            # fallback deterministic
+        # If LLM asked an unrelated meta-question, fallback
+        if re.search(r"\bWhen was this\b|\bWhen did\b|\bHow long ago\b|\bwhat time\b", raw, flags=re.I):
+            logger.warning("LLM asked meta-question unexpectedly; using deterministic summary instead.")
+            return self._deterministic_fallback(intent, entities, tool_result)
+
+        # If LLM returned bracket placeholders or JSON fragments, fallback
+        if re.search(r"\[.*?\]|\{.*?\}", raw):
+            logger.warning("LLM returned placeholders or JSON-like text; using deterministic fallback.")
+            return self._deterministic_fallback(intent, entities, tool_result)
+
+        # Sanity: ensure the reply uses numeric digits where expected for amounts (for balance/transactions/transfer)
+        if intent in ("balance", "transactions", "transfer"):
+            # If the LLM response lacks any digit at all, assume it hallucinated and fallback
+            if not re.search(r"\d", raw):
+                logger.warning("LLM reply lacks digits for numeric intent; falling back.")
+                return self._deterministic_fallback(intent, entities, tool_result)
+
+        # Final clean-up: strip repeated whitespace, ensure single trailing punctuation
+        reply = " ".join(raw.split())
+        # ensure it ends with a period or question mark or exclamation
+        if not re.search(r"[.!?]\s*$", reply):
+            reply = reply.rstrip() + "."
+
+        # Mask account numbers in the reply if the model echoed them unmasked
+        try:
+            # find token-like ACC tokens and mask last 4 digits
+            reply = re.sub(r"\b(ACC[0-9A-Za-z\-]{4,})\b", lambda m: self._mask_account(m.group(1)) or m.group(1), reply)
+        except Exception:
+            # ignore any masking errors
+            pass
+
+        return reply
+
+
+    # Helper deterministic fallback method (add to the class)
+    def _deterministic_fallback(self, intent: str, entities: Dict[str, Any], tool_result: Optional[Any]) -> str:
+        """
+        Deterministic safe messages when the LLM output is invalid or not trustworthy.
+        Keeps logic simple and predictable.
+        """
+        try:
+            # BALANCE
             if intent == "balance" and isinstance(tool_result, dict):
                 bal = tool_result.get("balance") or tool_result.get("available_balance")
                 cur = tool_result.get("currency") or "USD"
@@ -503,86 +620,61 @@ class LLMAgent:
                 acct = self._mask_account(entities.get("account_number") or tool_result.get("account_number"))
                 if bal_str:
                     return f"Your account {acct} has a balance of {bal_str}."
-            return "Sorry, I couldn't generate the reply. Would you like me to try again?"
 
-        return reply
+            # TRANSACTIONS
+            if intent == "transactions":
+                if isinstance(tool_result, dict):
+                    txs = tool_result.get("transactions")
+                elif isinstance(tool_result, list):
+                    txs = tool_result
+                else:
+                    txs = None
+                if isinstance(txs, list) and len(txs) > 0:
+                    t = txs[0]
+                    amt = t.get("amount") or t.get("value")
+                    cur = t.get("currency") or t.get("currency_code") or ""
+                    # direction: debit if negative or type indicates debit
+                    try:
+                        direction = "debit" if (t.get("type") == "debit" or (amt is not None and float(amt) < 0)) else "credit"
+                    except Exception:
+                        direction = "debit" if t.get("type") == "debit" else "credit"
+                    desc = t.get("description") or t.get("merchant") or t.get("narration") or "a transaction"
+                    acct = self._mask_account(t.get("account") or entities.get("account_number") or tool_result.get("account_number"))
+                    amt_str = self._format_amount(amt, cur or "")
+                    if amt_str:
+                        return f"Your most recent transaction for {acct} was a completed {direction} of {amt_str} for '{desc}'."
+                return "I couldn't find any recent transactions. Would you like me to fetch more details?"
 
+            # TRANSFER - success or failure summary
+            if intent == "transfer" and isinstance(tool_result, dict):
+                status = tool_result.get("status")
+                if status == "success":
+                    amount = tool_result.get("amount") or entities.get("amount")
+                    cur = tool_result.get("currency") or "USD"
+                    amt_str = self._format_amount(amount, cur)
+                    recipient = tool_result.get("to") or entities.get("recipient_name") or entities.get("to_account_number") or "the recipient"
+                    ref = tool_result.get("txn_id") or tool_result.get("transaction_reference") or tool_result.get("reference")
+                    if amt_str:
+                        if ref:
+                            return f"Transfer of {amt_str} to {recipient} completed successfully. Reference: {ref}."
+                        return f"Transfer of {amt_str} to {recipient} completed successfully."
+                # failure case
+                if status in ("error", "failed") or tool_result.get("message"):
+                    msg = tool_result.get("message") or "The transfer could not be completed."
+                    return f"I couldn't complete the transfer: {msg}. Please check and try again."
 
-    async def generate_response(self, intent: str, entities: Dict[str, Any], tool_result: Optional[Any] = None, reply_style: Optional[str] = "concise") -> str:
-        """
-        Generate natural language response based on intent and tool results.
-        Uses llm_client.generate(...) if available.
-        """
-        logger.debug("=" * 60)
-        logger.debug("GENERATE_RESPONSE - Starting")
-        logger.debug("Intent: %s | Entities: %s | Tool result: %s", intent, entities, tool_result)
-        
-        # If tool result exists, try to produce a concise user-facing message
-        try:
-            if isinstance(tool_result, dict):
-                logger.debug("Tool result is dict, attempting to format...")
-                # Successful transfer
-                if tool_result.get("status") == "success":
-                    logger.info("Tool returned success status")
-                    if intent == "transfer":
-                        logger.debug("Formatting transfer success response")
-                        amt = entities.get("amount") or (tool_result.get("amount") if isinstance(tool_result.get("amount"), (int, float)) else None)
-                        amt_str = f"{amt}" if amt is not None else "the requested amount"
-                        # get recipient info
-                        to = tool_result.get("to") or entities.get("recipient_name") or tool_result.get("recipient") or tool_result.get("to_account_number") or tool_result.get("to_account")
-                        txn_id = tool_result.get("txn_id") or tool_result.get("transaction_reference")
-                        response = f"Transfer of {amt_str} completed successfully to {to}. Transaction reference {txn_id}."
-                        logger.info("Generated transfer response: %s", response)
-                        logger.debug("GENERATE_RESPONSE - Complete")
-                        logger.debug("=" * 60)
-                        return response
-                    if intent == "balance":
-                        logger.debug("Formatting balance response")
-                        bal = tool_result.get("balance") or tool_result.get("available_balance")
-                        cur = tool_result.get("currency") or "USD"
-                        response = f"Your account balance is {bal} {cur}."
-                        logger.info("Generated balance response: %s", response)
-                        logger.debug("GENERATE_RESPONSE - Complete")
-                        logger.debug("=" * 60)
-                        return response
-                    if intent == "transactions":
-                        logger.debug("Formatting transactions response")
-                        txs = tool_result.get("transactions") or tool_result
-                        # summarize the most recent few transactions
-                        if isinstance(txs, list) and len(txs) > 0:
-                            first = txs[0]
-                            response = f"I found {len(txs)} transactions. Most recent: {first.get('transaction_reference')} {first.get('amount')} {first.get('currency')} ({first.get('status')})."
-                            logger.info("Generated transactions response: %s", response)
-                            logger.debug("GENERATE_RESPONSE - Complete")
-                            logger.debug("=" * 60)
-                            return response
-                        response = "No recent transactions found."
-                        logger.info("Generated transactions response: %s", response)
-                        logger.debug("GENERATE_RESPONSE - Complete")
-                        logger.debug("=" * 60)
-                        return response
-                # Tool returned non-success
-                logger.warning("Tool returned non-success status: %s", tool_result.get("status"))
-                # Let LLM craft a helpful message about the failure
-                prompt = f"Tool returned: {tool_result}. Please create a concise, user-friendly message explaining the result."
-                logger.debug("Calling LLM to format tool failure message...")
-                response = await self.call_llm(prompt)
-                logger.debug("GENERATE_RESPONSE - Complete")
-                logger.debug("=" * 60)
-                return response
+            # Generic fallback when no specific formatting applies
+            if isinstance(tool_result, dict) and tool_result.get("message"):
+                return str(tool_result.get("message"))
+
         except Exception as e:
-            logger.exception("Error while formatting tool_result: %s", e)
-            # continue to LLM fallback
+            logger.exception("Exception in deterministic fallback: %s", e)
 
-        # No tool result or formatting failed -> ask LLM for a reply
-        logger.debug("No tool result or formatting failed, calling LLM for general response...")
-        prompt = f"User intent: {intent}. Entities: {entities}. Provide a helpful assistant reply. style={reply_style}"
-        response = await self.call_llm(prompt)
-        logger.debug("GENERATE_RESPONSE - Complete")
-        logger.debug("=" * 60)
-        return response
+        # ultimate generic fallback
+        return "I couldn't retrieve the information right now. Would you like me to try again?"
 
-    async def call_llm(self, prompt: str, max_tokens: int = 256) -> str:
+
+    async def call_llm_deprecated(self, prompt: str, max_tokens: int = 256) -> str:
         """
         Wrapper around the LLM client. If a real llm_client is provided it will be used.
         Otherwise we use the GeminiLLMClient fallback.
@@ -634,6 +726,56 @@ class LLMAgent:
             logger.debug("CALL_LLM - Error")
             logger.debug("=" * 60)
             return "Sorry, I'm having trouble right now. Please try again in a moment."
+
+    async def call_llm(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[list] = None,
+        stream: Optional[bool] = False,
+        **extra_kwargs
+    ) -> str:
+        """
+        Wrapper around LLM client. Tries to pass optional generation kwargs but
+        falls back to positional generate(prompt, max_tokens) if the client doesn't accept them.
+        Returns a cleaned string.
+        """
+        if not self.llm_client:
+            try:
+                self.llm_client = GeminiLLMClient(api_key=GEMINI_API_KEY, model=self.model_name)
+            except Exception as e:
+                logger.exception("Failed to create Gemini client: %s", e)
+                raise RuntimeError("No LLM client available and Gemini client could not be created")
+
+        gen_kwargs = {"prompt": prompt, "max_tokens": max_tokens}
+        if temperature is not None:
+            gen_kwargs["temperature"] = float(temperature)
+        if top_p is not None:
+            gen_kwargs["top_p"] = float(top_p)
+        if stop is not None:
+            gen_kwargs["stop"] = stop
+        if stream:
+            gen_kwargs["stream"] = True
+        gen_kwargs.update(extra_kwargs)
+
+        try:
+            try:
+                text = await self.llm_client.generate(**gen_kwargs)
+            except TypeError:
+                # client doesn't accept kwargs — call positional fallback
+                text = await self.llm_client.generate(prompt, max_tokens)
+            # normalize text to string
+            if isinstance(text, str):
+                return text.strip()
+            if isinstance(text, dict):
+                return (text.get("text") or text.get("content") or str(text)).strip()
+            return str(text)
+        except Exception:
+            logger.exception("LLM client error; falling back to safe message.")
+            return "Sorry, I'm having trouble right now. Please try again in a moment."
+
 
     def should_confirm_action(self, intent: str, entities: Dict[str, Any]) -> bool:
         """
