@@ -22,7 +22,7 @@ VoxBank is an AI-powered voice banking assistant that enables users to perform s
 └──────┬──────────┘
        │
 ┌──────▼─────────────────┐
-│    MCP Tools           │ (Secure Microservices)
+│    MCP Tools           │ (Model Context Protocol)
 │  ┌──────┬──────┬─────┐ │
 │  │Balance│Transfer│...│ │
 │  └──────┴──────┴─────┘ │
@@ -37,7 +37,7 @@ VoxBank is an AI-powered voice banking assistant that enables users to perform s
 
 - **`/frontend`** - Voice UI (React/TypeScript)
 - **`/orchestrator`** - LLM orchestration and conversation engine
-- **`/mcp-tools`** - Secure MCP tool services (microservices)
+- **`/mcp-tools`** - Secure MCP tool services 
 - **`/mock-bank`** - Fake bank backend for testing
 - **`/auth-service`** - OTP + Voice Biometrics
 - **`/data`** - SQL schema and seed data
