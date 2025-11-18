@@ -20,6 +20,12 @@ dependencies = [
     "sqlalchemy",
     "psycopg2>=2.9.11",
     "asyncpg>=0.30.0",
+    "fastmcp>=2.13.1",
+    "speechbrain>=1.0.3",
+    "soundfile>=0.13.1",
+    "torchaudio==2.8.0",
+    "huggingface-hub==0.14.1",
+    "webrtcvad>=2.0.10",
 ]
 
 [tool.uv]
