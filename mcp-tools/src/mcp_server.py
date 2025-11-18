@@ -39,6 +39,71 @@ _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
 # Create MCP registry
 mcp = FastMCP(name="vox_mcp")
 
+# Canonical tool metadata (name -> description/params) exposed via list_tools.
+# This is the primary source for orchestrator prompts and tool validation.
+TOOL_METADATA = {
+    "balance": {
+        "description": "Get account balance",
+        "params": {
+            "account_number": {"type": "string", "required": True},
+        },
+    },
+    "transactions": {
+        "description": "Fetch recent transactions for an account",
+        "params": {
+            "account_number": {"type": "string", "required": True},
+            "limit": {"type": "integer", "required": False},
+        },
+    },
+    "transfer": {
+        "description": "Execute money transfer (HIGH RISK)",
+        "high_risk": True,
+        "params": {
+            "from_account_number": {"type": "string", "required": True},
+            "to_account_number": {"type": "string", "required": True},
+            "amount": {"type": "number", "required": True},
+            "currency": {"type": "string", "required": False, "default": "USD"},
+            "initiated_by_user_id": {"type": "string", "required": False},
+            "reference": {"type": "string", "required": False},
+        },
+    },
+    "register_user": {
+        "description": "Register a new VoxBank user with username and passphrase",
+        "params": {
+            "username": {"type": "string", "required": True},
+            "passphrase": {"type": "string", "required": True},
+            "email": {"type": "string", "required": False},
+            "full_name": {"type": "string", "required": False},
+            "phone_number": {"type": "string", "required": False},
+            "audio_embedding": {"type": "array[number]", "required": False},
+        },
+    },
+    "login_user": {
+        "description": "Validate username + passphrase and return user_id",
+        "params": {
+            "username": {"type": "string", "required": True},
+            "passphrase": {"type": "string", "required": True},
+        },
+    },
+    "set_user_audio_embedding": {
+        "description": "Set or replace the audio embedding for a user",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+            "audio_embedding": {"type": "array[number]", "required": True},
+        },
+    },
+    "get_user_profile": {
+        "description": "Fetch a user's profile by user_id",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+        },
+    },
+    "list_tools": {
+        "description": "List available MCP tools",
+        "params": {},
+    },
+}
+
 # -----------------------------
 # Tools
 # -----------------------------
@@ -105,24 +170,119 @@ async def transfer(
         return {"error": str(e)}
 
 
+@mcp.tool(name="register_user", description="Register a new VoxBank user with username and passphrase")
+async def register_user(
+    username: str,
+    passphrase: str,
+    email: str | None = None,
+    full_name: str | None = None,
+    phone_number: str | None = None,
+    audio_embedding: list[float] | None = None,
+) -> dict:
+    """
+    Wraps POST /api/users on the mock-bank service.
+    """
+    url = f"{VOX_BANK_BASE}/api/users"
+    payload = {
+        "username": username,
+        "passphrase": passphrase,
+        "email": email,
+        "full_name": full_name,
+        "phone_number": phone_number,
+        "audio_embedding": audio_embedding,
+    }
+    try:
+        r = await _http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return {"status": "success", "user": data}
+    except httpx.HTTPStatusError as e:
+        logger.error("register_user error: %s", e)
+        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
+        return {"status": "error", "message": detail, "http_status": e.response.status_code}
+    except Exception as e:
+        logger.error("register_user unexpected error: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool(name="login_user", description="Validate username + passphrase and return user_id")
+async def login_user(username: str, passphrase: str) -> dict:
+    """
+    Wraps POST /api/login on the mock-bank service.
+    """
+    url = f"{VOX_BANK_BASE}/api/login"
+    payload = {"username": username, "passphrase": passphrase}
+    try:
+        r = await _http.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "status": data.get("status", "ok"),
+            "user_id": data.get("user_id"),
+            "username": data.get("username"),
+            "has_audio_embedding": data.get("has_audio_embedding", False),
+            "message": data.get("message"),
+        }
+    except httpx.HTTPStatusError as e:
+        logger.error("login_user error: %s", e)
+        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
+        return {"status": "error", "message": detail, "http_status": e.response.status_code}
+    except Exception as e:
+        logger.error("login_user unexpected error: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool(name="set_user_audio_embedding", description="Set or replace the audio embedding for a user")
+async def set_user_audio_embedding(user_id: str, audio_embedding: list[float]) -> dict:
+    """
+    Wraps PUT /api/users/{user_id}/audio-embedding.
+    """
+    url = f"{VOX_BANK_BASE}/api/users/{user_id}/audio-embedding"
+    payload = {"audio_embedding": audio_embedding}
+    try:
+        r = await _http.put(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return {"status": "success", "user": data}
+    except httpx.HTTPStatusError as e:
+        logger.error("set_user_audio_embedding error: %s", e)
+        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
+        return {"status": "error", "message": detail, "http_status": e.response.status_code}
+    except Exception as e:
+        logger.error("set_user_audio_embedding unexpected error: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool(name="get_user_profile", description="Fetch a user's profile by user_id")
+async def get_user_profile(user_id: str) -> dict:
+    """
+    Wraps GET /api/users/{user_id} and returns profile info.
+    """
+    url = f"{VOX_BANK_BASE}/api/users/{user_id}"
+    try:
+        r = await _http.get(url)
+        r.raise_for_status()
+        data = r.json()
+        return {"status": "success", "user": data}
+    except httpx.HTTPStatusError as e:
+        logger.error("get_user_profile error: %s", e)
+        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
+        return {"status": "error", "message": detail, "http_status": e.response.status_code}
+    except Exception as e:
+        logger.error("get_user_profile unexpected error: %s", e)
+        return {"status": "error", "message": str(e)}
+
+
 @mcp.tool(name="list_tools", description="List available MCP tools")
 def list_tools() -> dict:
-    """List all available MCP tools"""
+    """Return metadata for all available MCP tools."""
     try:
-        # FastMCP stores tools in its internal registry
-        # Access via the mcp instance's tools attribute
-        if hasattr(mcp, 'tools') and mcp.tools:
-            tool_names = list(mcp.tools.keys())
-        elif hasattr(mcp, '_tools') and mcp._tools:
-            tool_names = list(mcp._tools.keys())
-        else:
-            # Fallback: return known tools
-            tool_names = [] #["balance", "transactions", "transfer", "list_tools"]
-        return {"tools": tool_names}
+        # Prefer TOOL_METADATA as the canonical source. This ensures the
+        # orchestrator can build prompts and validation rules dynamically.
+        return {"tools": TOOL_METADATA}
     except Exception as e:
         logger.error(f"Error in list_tools: {e}")
-        # Return known tools as fallback
-        return {"tools": []}
+        return {"tools": {}}
 
 
 # -----------------------------
