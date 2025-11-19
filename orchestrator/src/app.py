@@ -49,11 +49,14 @@ class TextRequest(BaseModel):
     user_id: str
     # optional flag to request a short/long reply
     reply_style: Optional[str] = "concise"  # 'concise' | 'detailed'
+    # optional flag: also request audio TTS for this reply
+    output_audio: Optional[bool] = False
 
 class TextResponse(BaseModel):
     response_text: str
     session_id: str
     requires_confirmation: bool = False
+    audio_url: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
 class VoiceRequest(BaseModel):
@@ -754,6 +757,8 @@ async def websocket_chat(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "error", "message": "empty_transcript"}))
                     continue
 
+                output_audio = bool(data.get("output_audio"))
+
                 # Resolve or create session_id for this connection
                 session_id = data.get("session_id") or current_session_id or "ws-session"
                 current_session_id = session_id
@@ -788,6 +793,30 @@ async def websocket_chat(ws: WebSocket):
                     # Normal reply path
                     response_text = out.get("response") or out.get("message") or "I couldn't process that request right now."
                     session["history"].append({"role": "assistant", "text": response_text})
+
+                    # Optionally generate server-side TTS audio for this reply
+                    if output_audio and response_text:
+                        try:
+                            audio_bytes = await synthesize_text_to_audio(response_text)
+                            if audio_bytes:
+                                audio_url = audio_bytes_to_data_url(audio_bytes, mime="audio/wav")
+                                await ws.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "audio_base64",
+                                            "audio": audio_url,
+                                            "mime": "audio/wav",
+                                            "session_id": session_id,
+                                        }
+                                    )
+                                )
+                                logger.info(
+                                    "WS: sent TTS audio for session %s (len=%d bytes)",
+                                    session_id,
+                                    len(audio_bytes),
+                                )
+                        except Exception as e:
+                            logger.exception("WS: TTS generation failed: %s", e)
 
                     await ws.send_text(json.dumps({"type": "reply", "text": response_text, "session_id": session_id}))
                 except Exception as e:
@@ -855,7 +884,22 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             session["pending_action"] = {"parsed": out.get("parsed"), "transcript": transcript}
             resp_text = out.get("message", "Please confirm the action.")
             logger.info("Returning confirmation request: %s", resp_text)
-            return TextResponse(response_text=resp_text, session_id=session_id, requires_confirmation=True, meta={"parsed": out.get("parsed")})
+            audio_url = None
+            if request.output_audio:
+                try:
+                    audio_bytes = await synthesize_text_to_audio(resp_text)
+                    if audio_bytes:
+                        audio_url = audio_bytes_to_data_url(audio_bytes, mime="audio/wav")
+                        logger.info("Text TTS (confirm): generated audio (%d bytes) for session %s", len(audio_bytes), session_id)
+                except Exception as e:
+                    logger.exception("Text TTS (confirm) failed: %s", e)
+            return TextResponse(
+                response_text=resp_text,
+                session_id=session_id,
+                requires_confirmation=True,
+                audio_url=audio_url,
+                meta={"parsed": out.get("parsed")},
+            )
         
         # If agent needs clarification (missing information or auth/login)
         elif out.get("status") == "clarify":
@@ -877,11 +921,22 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             session["history"].append({"role": "assistant", "text": clarify_message})
             
             # Return clarification response (no confirmation needed, just asking for more info)
+            audio_url = None
+            if request.output_audio:
+                try:
+                    audio_bytes = await synthesize_text_to_audio(clarify_message)
+                    if audio_bytes:
+                        audio_url = audio_bytes_to_data_url(audio_bytes, mime="audio/wav")
+                        logger.info("Text TTS (clarify): generated audio (%d bytes) for session %s", len(audio_bytes), session_id)
+                except Exception as e:
+                    logger.exception("Text TTS (clarify) failed: %s", e)
+
             return TextResponse(
-                response_text=clarify_message, 
-                session_id=session_id, 
-                requires_confirmation=False, 
-                meta={"parsed": out.get("parsed"), "status": "clarify"}
+                response_text=clarify_message,
+                session_id=session_id,
+                requires_confirmation=False,
+                audio_url=audio_url,
+                meta={"parsed": out.get("parsed"), "status": "clarify"},
             )
         
         # If auth just completed, persist authenticated user_id into session
@@ -899,11 +954,26 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
         if not response_text:
             logger.error("Agent returned None response_text. Full output: %s", out)
             response_text = "I apologize, but I'm having trouble processing your request. Please try again."
-        
+
+        audio_url = None
+        if request.output_audio:
+            try:
+                audio_bytes = await synthesize_text_to_audio(response_text)
+                if audio_bytes:
+                    audio_url = audio_bytes_to_data_url(audio_bytes, mime="audio/wav")
+                    logger.info("Text TTS: generated audio (%d bytes) for session %s", len(audio_bytes), session_id)
+            except Exception as e:
+                logger.exception("Text TTS failed: %s", e)
+
         session["history"].append({"role": "assistant", "text": response_text})
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
-        return TextResponse(response_text=response_text, session_id=session_id, requires_confirmation=False)
+        return TextResponse(
+            response_text=response_text,
+            session_id=session_id,
+            requires_confirmation=False,
+            audio_url=audio_url,
+        )
 
     except Exception as e:
         logger.exception("Error in process_text: %s", e)

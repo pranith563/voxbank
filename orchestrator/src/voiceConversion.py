@@ -278,6 +278,3 @@ async def root():
     return HTMLResponse(content=html, status_code=200)
 
 
-if __name__ == "__main__":
-    # Run with: export GOOGLE_API_KEY="YOUR_KEY" && python voiceConversion.py
-    uvicorn.run("voiceConversion:app", host="0.0.0.0", port=8000)

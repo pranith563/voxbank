@@ -11,6 +11,9 @@ declare global {
 const WS_URL = "ws://localhost:8000/ws";
 // 2 seconds silence
 const SILENCE_TIMEOUT_MS = 2000;
+// Toggle to prefer server-side TTS (audio from backend) vs browser speechSynthesis.
+// When true, the client requests audio over WebSocket and will not use browser TTS.
+const USE_SERVER_TTS = true;
 
 type AgentMode = "idle" | "listening" | "thinking" | "speaking";
 
@@ -75,6 +78,7 @@ export default function VoiceSearchGeminiBrowser({
       wasListeningBeforePlaybackRef.current = listeningRef.current === true;
       pausedForPlaybackRef.current = true;
       setPausedForPlayback(true);
+      setAgentMode("speaking");
       userStoppedRef.current = false;
       try {
         if (recognitionRef.current) recognitionRef.current.stop();
@@ -88,6 +92,7 @@ export default function VoiceSearchGeminiBrowser({
       console.log("[Audio] onended -> resume recognition if applicable");
       pausedForPlaybackRef.current = false;
       setPausedForPlayback(false);
+      setAgentMode("idle");
 
       if (wasListeningBeforePlaybackRef.current && !userStoppedRef.current) {
         setTimeout(() => {
@@ -174,33 +179,39 @@ export default function VoiceSearchGeminiBrowser({
       // text frames
       try {
         const msgText = typeof event.data === "string" ? event.data : await event.data.text();
-        let parsed = null;
-        try { parsed = JSON.parse(msgText); } catch (e) { parsed = null; }
-
-    if (parsed && (parsed.type === "audio" || parsed.type === "audio_base64") && parsed.audio) {
-      console.log("[WS] Received base64 audio payload. Playing...");
-      const mime = parsed.mime || parsed.format || "audio/wav";
-      playBase64Audio(parsed.audio, mime);
-      return;
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(msgText);
+        } catch (e) {
+          parsed = null;
         }
 
-    if (parsed && parsed.type === "ack") {
-      console.log("[WS] Server ack:", parsed);
-      return;
+        if (parsed && (parsed.type === "audio" || parsed.type === "audio_base64") && parsed.audio) {
+          console.log("[WS] Received base64 audio payload. Playing...");
+          const mime = parsed.mime || parsed.format || "audio/wav";
+          playBase64Audio(parsed.audio, mime);
+          return;
         }
 
-    if (parsed && parsed.type === "transcript_echo" && parsed.text) {
-      console.log("[WS] server transcript echo:", parsed.text);
-      return;
-    }
+        if (parsed && parsed.type === "ack") {
+          console.log("[WS] Server ack:", parsed);
+          return;
+        }
 
-    if (parsed && parsed.type === "reply" && parsed.text) {
-      console.log("[WS] reply text:", parsed.text);
-      setAgentMode("speaking");
-      setChatMessages((prev) => [...prev, { role: "assistant", text: parsed.text }]);
-      // Use browser TTS to speak the assistant reply.
-      speak(parsed.text);
-      return;
+        if (parsed && parsed.type === "transcript_echo" && parsed.text) {
+          console.log("[WS] server transcript echo:", parsed.text);
+          return;
+        }
+
+        if (parsed && parsed.type === "reply" && parsed.text) {
+          console.log("[WS] reply text:", parsed.text);
+          setChatMessages((prev) => [...prev, { role: "assistant", text: parsed.text }]);
+          if (!USE_SERVER_TTS) {
+            // Browser TTS mode
+            setAgentMode("speaking");
+            speak(parsed.text);
+          }
+          return;
         }
 
         console.log("[WS] Received text payload (unparsed):", msgText);
@@ -311,21 +322,19 @@ export default function VoiceSearchGeminiBrowser({
       return;
     }
 
+    const payload = { type: "transcript", text: newText, session_id: sessionId, output_audio: USE_SERVER_TTS };
+
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       wsRef.current = createWebSocket();
       wsRef.current.onopen = () => {
         try {
-          wsRef.current?.send(
-            JSON.stringify({ type: "transcript", text: newText, session_id: sessionId }),
-          );
+          wsRef.current?.send(JSON.stringify(payload));
         }
         catch (e) { console.error("[WS] send error after open", e); }
       };
     } else {
       try {
-        wsRef.current.send(
-          JSON.stringify({ type: "transcript", text: newText, session_id: sessionId }),
-        );
+        wsRef.current.send(JSON.stringify(payload));
       }
       catch (e) { console.error("[WS] send error", e); }
     }
