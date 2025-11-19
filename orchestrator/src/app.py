@@ -124,6 +124,126 @@ session_manager = SessionManager(
 # sees the same underlying dictionary.
 SESSIONS: Dict[str, Dict[str, Any]] = session_manager.sessions
 
+
+def get_session_profile(session_id: str) -> Dict[str, Any]:
+    """
+    Return a compact session profile structure for the given session_id.
+
+    This is used by downstream endpoints so they don't need to know the
+    internal layout of the SessionManager's session dict.
+    """
+    sess = session_manager.get_session(session_id)
+    if not sess:
+        logger.info("Session profile requested for unknown session_id=%s", session_id)
+        return {
+            "user_id": None,
+            "username": None,
+            "is_authenticated": False,
+            "is_voice_verified": False,
+            "primary_account": None,
+            "accounts": [],
+        }
+
+    profile = {
+        "user_id": sess.get("user_id"),
+        "username": sess.get("username"),
+        "is_authenticated": bool(sess.get("is_authenticated")),
+        "is_voice_verified": bool(sess.get("is_voice_verified")),
+        "primary_account": sess.get("primary_account"),
+        "accounts": sess.get("accounts") or [],
+    }
+    logger.info(
+        "Session profile for %s -> user_id=%s username=%s primary_account=%s accounts=%d",
+        session_id,
+        profile["user_id"],
+        profile["username"],
+        profile["primary_account"],
+        len(profile["accounts"]),
+    )
+    return profile
+
+
+async def hydrate_session_profile_from_mock_bank(session_id: str, user_id: str) -> None:
+    """
+    Fetch user profile + accounts from mock-bank and cache them on the session.
+
+    This is used after a successful login (either via HTTP login endpoint or
+    conversational auth) so that subsequent LLM/tool calls can rely on a
+    populated session_profile.
+    """
+    base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+    if not base:
+        logger.error("hydrate_session_profile: VOX_BANK_BASE_URL not configured; cannot hydrate profile")
+        return
+
+    accounts_compact: list[Dict[str, Any]] = []
+    primary_account: Optional[str] = None
+
+    profile_data: Dict[str, Any] = {}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            profile_url = f"{base}/api/users/{user_id}"
+            accounts_url = f"{base}/api/users/{user_id}/accounts"
+
+            logger.info("hydrate_session_profile: fetching profile from %s", profile_url)
+            try:
+                profile_resp = await client.get(profile_url)
+                profile_resp.raise_for_status()
+                profile_data = profile_resp.json() or {}
+                logger.info(
+                    "hydrate_session_profile: profile fetch successful for user_id=%s username=%s",
+                    user_id,
+                    profile_data.get("username"),
+                )
+            except Exception as e:
+                logger.warning("hydrate_session_profile: profile fetch failed for user_id=%s error=%s", user_id, e)
+
+            logger.info("hydrate_session_profile: fetching accounts from %s", accounts_url)
+            try:
+                accounts_resp = await client.get(accounts_url)
+                accounts_resp.raise_for_status()
+                accounts_full = accounts_resp.json() or []
+
+                for acc in accounts_full:
+                    acct_num = acc.get("account_number")
+                    if not acct_num:
+                        continue
+                    accounts_compact.append(
+                        {
+                            "account_number": acct_num,
+                            "account_type": acc.get("account_type"),
+                            "currency": acc.get("currency"),
+                        }
+                    )
+                # Decide primary account: prefer savings, else first
+                for acc in accounts_full:
+                    if (acc.get("account_type") or "").strip().lower() == "savings":
+                        primary_account = acc.get("account_number")
+                        break
+                if not primary_account and accounts_full:
+                    primary_account = accounts_full[0].get("account_number")
+
+                logger.info(
+                    "hydrate_session_profile: cached %d accounts for user_id=%s primary_account=%s",
+                    len(accounts_compact),
+                    user_id,
+                    primary_account,
+                )
+            except Exception as e:
+                logger.warning("hydrate_session_profile: accounts fetch failed for user_id=%s error=%s", user_id, e)
+    except Exception as e:
+        logger.exception("hydrate_session_profile: unexpected error while fetching profile/accounts: %s", e)
+
+    # Update session profile fields
+    sess = session_manager.ensure_session(session_id, user_id=user_id)
+    # Prefer username from profile if available
+    if profile_data.get("username"):
+        sess["username"] = profile_data["username"]
+    sess["accounts"] = accounts_compact
+    sess["primary_account"] = primary_account
+    sess["is_authenticated"] = True
+
 # Instantiate clients on startup
 @app.on_event("startup")
 async def startup_event():
@@ -373,14 +493,16 @@ async def login_user(request: LoginRequest) -> Dict[str, Any]:
                     detail = resp.text
                 logger.warning("Login: mock-bank error status=%s detail=%s", resp.status_code, detail)
                 raise HTTPException(status_code=resp.status_code, detail=detail or "Login failed")
-            data = resp.json()
+        data = resp.json()
 
         user_id = str(data.get("user_id"))
         username = (data.get("username") or username_norm)
 
-        # Bind session state
+        # Bind basic session state
         sess = session_manager.ensure_session(request.session_id, user_id=user_id)
         sess["username"] = username
+        # hydrate profile (includes setting is_authenticated)
+        await hydrate_session_profile_from_mock_bank(request.session_id, user_id)
 
         # Sync LLMAgent auth state
         try:
@@ -393,7 +515,11 @@ async def login_user(request: LoginRequest) -> Dict[str, Any]:
         except Exception as e:
             logger.exception("Login: failed to sync agent auth_state: %s", e)
 
-        return {"status": "ok", "user": {"user_id": user_id, "username": username}, "session_id": request.session_id}
+        return {
+            "status": "ok",
+            "user": {"user_id": user_id, "username": username},
+            "session_id": request.session_id,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -490,14 +616,25 @@ async def websocket_chat(ws: WebSocket):
                 try:
                     agent: LLMAgent = app.state.agent
                     logger.info("WS: calling agent.orchestrate() for session %s", session_id)
-                    out = await agent.orchestrate(transcript, session_id, user_confirmation=None)
+                    profile = get_session_profile(session_id)
+                    out = await agent.orchestrate(
+                        transcript,
+                        session_id,
+                        user_confirmation=None,
+                        session_profile=profile,
+                    )
                     logger.info("WS: orchestrate returned status=%s", out.get("status"))
 
-                    # If auth just completed, persist authenticated user_id into session
+                    # If auth just completed, persist authenticated user_id into session and hydrate profile
                     auth_user_id = out.get("authenticated_user_id")
                     if auth_user_id:
                         session["user_id"] = auth_user_id
                         logger.info("Session %s authenticated as user %s (ws)", session_id, auth_user_id)
+                        # best-effort: hydrate profile for this session
+                        try:
+                            await hydrate_session_profile_from_mock_bank(session_id, str(auth_user_id))
+                        except Exception as e:
+                            logger.exception("WS: failed to hydrate session profile after auth: %s", e)
 
                     # Normal reply path
                     response_text = out.get("response") or out.get("message") or "I couldn't process that request right now."
@@ -552,8 +689,13 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
         logger.info("Calling agent.orchestrate()")
 
         # Orchestrate (agent should return structure similar to voice flow)
-        out = await agent.orchestrate(transcript, session_id, user_confirmation=None) \
-              if hasattr(agent, "orchestrate") else await agent.process_user_input(transcript, session_id)
+        profile = get_session_profile(session_id)
+        out = await agent.orchestrate(
+            transcript,
+            session_id,
+            user_confirmation=None,
+            session_profile=profile,
+        ) if hasattr(agent, "orchestrate") else await agent.process_user_input(transcript, session_id)
         
         logger.info("Agent orchestrate returned: status=%s", out.get("status"))
         logger.debug("Full orchestrate response: %s", out)
@@ -598,6 +740,10 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
         if auth_user_id:
             session["user_id"] = auth_user_id
             logger.info("Session %s authenticated as user %s (text)", session_id, auth_user_id)
+            try:
+                await hydrate_session_profile_from_mock_bank(session_id, str(auth_user_id))
+            except Exception as e:
+                logger.exception("Text: failed to hydrate session profile after auth: %s", e)
 
         # Normal response path
         response_text = out.get("response")
@@ -646,7 +792,14 @@ async def parse_intent(req: TextRequest):
         # Fallback: call orchestrate in "parse-only" mode if supported
         if hasattr(agent, "orchestrate"):
             logger.debug("Using agent.orchestrate(parse_only=True)")
-            out = await agent.orchestrate(transcript, req.session_id, user_confirmation=None, parse_only=True)
+            profile = get_session_profile(req.session_id)
+            out = await agent.orchestrate(
+                transcript,
+                req.session_id,
+                user_confirmation=None,
+                parse_only=True,
+                session_profile=profile,
+            )
             parsed = out.get("parsed") or out
             logger.info("Intent parsed via orchestrate: %s", parsed.get("intent") if isinstance(parsed, dict) else "unknown")
             return {"parsed": parsed}
@@ -745,8 +898,14 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
     try:
         agent: LLMAgent = app.state.agent
         logger.info("Calling agent.orchestrate() for voice")
+        profile = get_session_profile(session_id)
         # Orchestrate: this will return needs_confirmation if LLM asks for it
-        out = await agent.orchestrate(transcript, session_id, user_confirmation=None)
+        out = await agent.orchestrate(
+            transcript,
+            session_id,
+            user_confirmation=None,
+            session_profile=profile,
+        )
         logger.info("Agent orchestrate returned: status=%s", out.get("status"))
         logger.debug("Full orchestrate response: %s", out)
 
@@ -785,11 +944,15 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
                 meta={"parsed": out.get("parsed"), "status": "clarify"}
             )
 
-        # If auth just completed, persist authenticated user_id into session
+        # If auth just completed, persist authenticated user_id into session and hydrate profile
         auth_user_id = out.get("authenticated_user_id")
         if auth_user_id:
             session["user_id"] = auth_user_id
             logger.info("Session %s authenticated as user %s (voice)", session_id, auth_user_id)
+            try:
+                await hydrate_session_profile_from_mock_bank(session_id, str(auth_user_id))
+            except Exception as e:
+                logger.exception("Voice: failed to hydrate session profile after auth: %s", e)
 
         # Normal completed response
         response_text = out.get("response")

@@ -38,7 +38,12 @@ except ImportError:
 import math
 from decimal import Decimal
 
-from prompts.vox_assistant import TOOL_SPEC as FALLBACK_TOOL_SPEC, REACT_PROMPT_TEMPLATE, SYSTEM_PROMPT
+from prompts.vox_assistant import (
+    TOOL_SPEC as FALLBACK_TOOL_SPEC,
+    PRELOGIN_PROMPT_TEMPLATE,
+    POSTLOGIN_PROMPT_TEMPLATE,
+    SYSTEM_PROMPT,
+)
 
 def _format_amount(self, value, currency="USD"):
     """Return a nicely formatted amount string or None if invalid."""
@@ -181,7 +186,9 @@ class LLMAgent:
         #   "temp": Dict[str, Any]
         # }
         self.auth_state: Dict[str, Dict[str, Any]] = {}
-        self.prompt_template = REACT_PROMPT_TEMPLATE
+        # Separate prompt templates for pre-login and post-login
+        self.prelogin_prompt_template = PRELOGIN_PROMPT_TEMPLATE
+        self.postlogin_prompt_template = POSTLOGIN_PROMPT_TEMPLATE
         # Dynamic tool spec, primarily sourced from MCP list_tools; falls back to
         # static TOOL_SPEC from prompts.vox_assistant if not provided.
         self.tool_spec: Dict[str, Any] = {}
@@ -522,6 +529,7 @@ class LLMAgent:
         self,
         transcript: str,
         context: str,
+        session_profile: Optional[Dict[str, Any]] = None,
         observation: Optional[Any] = None,
         auth_state: Optional[bool] = None,
         max_tokens: int = 512,
@@ -534,21 +542,51 @@ class LLMAgent:
         logger.info("=" * 80)
         logger.info("LLM DECISION - Starting")
         logger.info("Context: %s | Transcript: %s", context, transcript)
-        
-        # add context/history to the prompt, tools_block too
-        auth_str = "true" if auth_state else "false"
-        prompt = (
-            self.prompt_template
-            .replace("{history}", context)
-            .replace("{tools_block}", self.tools_block)
-            .replace("{auth_state}", auth_str)
-            .strip()
-        )
+
+        # Determine authentication flag from explicit auth_state or session_profile
+        if auth_state is None and session_profile is not None:
+            is_auth = bool(session_profile.get("is_authenticated"))
+        else:
+            is_auth = bool(auth_state)
+
+        if not is_auth:
+            # PRE-LOGIN: no tools, no user-specific context
+            logger.info("LLM DECISION - Using PRELOGIN prompt template (unauthenticated)")
+            prompt = (
+                self.prelogin_prompt_template
+                .replace("{history}", context)
+                .strip()
+            )
+        else:
+            # POST-LOGIN: tools and user context available
+            logger.info("LLM DECISION - Using POSTLOGIN prompt template (authenticated)")
+            # Build a simple user context block from session_profile
+            user_context_lines = []
+            if session_profile:
+                user_context_lines.append(f"- user_id: {session_profile.get('user_id')}")
+                user_context_lines.append(f"- username: {session_profile.get('username')}")
+                primary_acct = session_profile.get("primary_account")
+                user_context_lines.append(f"- primary_account: {primary_acct}")
+                # Derive account types summary
+                acct_types = []
+                for acc in session_profile.get("accounts") or []:
+                    t = (acc.get("account_type") or "").strip().lower()
+                    if t and t not in acct_types:
+                        acct_types.append(t)
+                if acct_types:
+                    user_context_lines.append(f"- other_accounts: {', '.join(acct_types)}")
+            user_context_block = "\n".join(user_context_lines) if user_context_lines else "- (none)"
+
+            prompt = (
+                self.postlogin_prompt_template
+                .replace("{history}", context)
+                .replace("{tools_block}", self.tools_block)
+                .replace("{user_context_block}", user_context_block)
+                .strip()
+            )
 
         # Add the user request at the end
         prompt = f"{prompt}\n\nUser request: \"{transcript}\"\n"
-        
-        logger.info("LLM FULL PROMPT: %s",prompt)
         # If observation present, append observation JSON for LLM to reason about
         if observation is not None:
             try:
@@ -559,7 +597,6 @@ class LLMAgent:
 
         prompt += "\nReturn JSON now."
         logger.info("Calling LLM with prompt (length: %d chars)", len(prompt))
-        logger.debug("Full prompt: %s", prompt[:500] + "..." if len(prompt) > 500 else prompt)
 
         # call llm
         raw = await self.call_llm(prompt, max_tokens=max_tokens)
@@ -619,7 +656,24 @@ class LLMAgent:
                    parsed["action"], parsed["intent"], parsed["requires_tool"], parsed.get("tool_name"))
         logger.debug("Full parsed decision: %s", parsed)
 
-        # Validate tool_input if action == call_tool
+        # Enforce pre-login restrictions: never call tools when not authenticated
+        if not is_auth:
+            if parsed.get("requires_tool"):
+                logger.warning("Pre-login mode: overriding requires_tool=true to false")
+            if parsed.get("tool_name"):
+                logger.warning("Pre-login mode: clearing tool_name '%s'", parsed.get("tool_name"))
+            # If the model requested a tool call, convert it into an ask_user prompting for login
+            if parsed["action"] == "call_tool":
+                parsed["action"] = "ask_user"
+                parsed["response"] = (
+                    parsed.get("response")
+                    or "You need to log in or register before I can access your accounts. Please tell me your username to begin."
+                )
+            parsed["requires_tool"] = False
+            parsed["tool_name"] = None
+            parsed["tool_input"] = {}
+
+        # Validate tool_input if action == call_tool (post-login only)
         if parsed["action"] == "call_tool" and parsed.get("tool_name"):
             tool = parsed["tool_name"]
             logger.info("Validating tool call: %s", tool)
@@ -670,7 +724,16 @@ class LLMAgent:
         logger.info("=" * 80)
         return parsed
 
-    async def orchestrate(self, transcript: str, session_id: str, user_confirmation: Optional[bool] = None, reply_style: Optional[str] = "concise", parse_only: bool = False, max_iterations: int = 4) -> Dict[str, Any]:
+    async def orchestrate(
+        self,
+        transcript: str,
+        session_id: str,
+        user_confirmation: Optional[bool] = None,
+        reply_style: Optional[str] = "concise",
+        parse_only: bool = False,
+        max_iterations: int = 4,
+        session_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         ReAct style orchestration loop:
         - call decision()
@@ -682,8 +745,14 @@ class LLMAgent:
         logger.info("Session: %s | Transcript: %s", session_id, transcript)
         logger.info("User confirmation: %s | Parse only: %s | Reply style: %s", user_confirmation, parse_only, reply_style)
 
-        
-        
+        if session_profile:
+            logger.info(
+                "ORCHESTRATE: session_profile user_id=%s username=%s primary_account=%s accounts=%d",
+                session_profile.get("user_id"),
+                session_profile.get("username"),
+                session_profile.get("primary_account"),
+                len(session_profile.get("accounts") or []),
+            )
 
         auth_state = self._get_auth_state(session_id)
         # If we are currently in a login / registration flow, handle it
@@ -739,6 +808,7 @@ class LLMAgent:
             parsed = await self.decision(
                 transcript,
                 context_str,
+                session_profile=session_profile,
                 observation=observation,
                 auth_state=auth_flag,
             )
@@ -847,6 +917,49 @@ class LLMAgent:
                     logger.info("=" * 80)
                     return {"status": "clarify", "message": msg, "parsed": parsed}
 
+                # Resolve abstract account labels (primary/savings/current) to concrete account_numbers
+                # before executing tools. This biases tools toward the primary account unless the user
+                # explicitly refers to another account type.
+                if session_profile:
+                    # Balance / transactions: map account_number
+                    if tool_name in ("balance", "transactions"):
+                        acct_label = tool_input.get("account_number")
+                        acct_number = self._resolve_account_from_profile(session_profile, acct_label)
+                        if not acct_number:
+                            clarify = (
+                                "I couldn't determine which account to use. "
+                                "Please specify which account (for example, your savings or current account)."
+                            )
+                            self._append_history(session_id, {"role": "assistant", "text": clarify})
+                            logger.info(
+                                "ORCHESTRATE - Unable to resolve account label '%s' for tool %s; asking user to clarify",
+                                acct_label,
+                                tool_name,
+                            )
+                            logger.info("=" * 80)
+                            return {"status": "clarify", "message": clarify, "parsed": parsed}
+                        tool_input["account_number"] = acct_number
+                        parsed["tool_input"]["account_number"] = acct_number
+
+                    # Transfer: map from_account only; to_account may be external
+                    if tool_name == "transfer":
+                        from_label = tool_input.get("from_account_number")
+                        from_number = self._resolve_account_from_profile(session_profile, from_label)
+                        if not from_number:
+                            clarify = (
+                                "Which account would you like to send money from? "
+                                "You can say your savings account or current account."
+                            )
+                            self._append_history(session_id, {"role": "assistant", "text": clarify})
+                            logger.info(
+                                "ORCHESTRATE - Unable to resolve from_account label '%s' for transfer; asking user to clarify",
+                                from_label,
+                            )
+                            logger.info("=" * 80)
+                            return {"status": "clarify", "message": clarify, "parsed": parsed}
+                        tool_input["from_account_number"] = from_number
+                        parsed["tool_input"]["from_account_number"] = from_number
+
                 # Enforce confirmation for high-risk actions
                 if requires_confirmation and not user_confirmation:
                     confirm_msg = f"I will perform: {intent}. {assistant_response or 'Do you want to proceed?'}"
@@ -940,7 +1053,7 @@ class LLMAgent:
             raw = await self.call_llm(prompt, max_tokens=max_tokens)
 
         raw = (raw or "").strip()
-        logger.debug("LLM reply (raw): %s", raw[:1000])
+        logger.debug("LLM reply length=%d", len(raw))
 
         # Basic sanitation: if empty or appears to contain placeholders or a meta question -> fallback
         if not raw:
@@ -1058,7 +1171,6 @@ class LLMAgent:
         logger.debug("=" * 60)
         logger.debug("CALL_LLM - Starting")
         logger.debug("Prompt length: %d chars | Max tokens: %d", len(prompt), max_tokens)
-        logger.debug("Prompt preview: %s", prompt[:200] + "..." if len(prompt) > 200 else prompt)
         
         if not self.llm_client:
             logger.warning("LLM client not set, attempting to create Gemini client...")
@@ -1164,6 +1276,56 @@ class LLMAgent:
 
     def get_history(self, session_id: str) -> List[Dict[str, Any]]:
         return self.conversation_history.get(session_id, [])
+
+    # -----------------------
+    # Account resolution helpers
+    # -----------------------
+    def _resolve_account_from_profile(
+        self,
+        session_profile: Optional[Dict[str, Any]],
+        label: Optional[str],
+    ) -> Optional[str]:
+        """
+        Given a session_profile and an abstract label like "primary", "savings",
+        or "current", return a concrete account_number if possible.
+
+        This helper is intentionally small and logic-only so it can be unit-tested.
+        """
+        if not session_profile:
+            return None
+
+        primary = session_profile.get("primary_account")
+        accounts = session_profile.get("accounts") or []
+
+        if not label:
+            # No label -> use primary if available
+            return primary
+
+        label_norm = str(label).strip().lower()
+
+        # Primary / default
+        if label_norm in {"primary", "default", "my account", "my primary account"}:
+            return primary
+
+        # Savings / current mapping by account_type
+        def find_by_type(substr: str) -> Optional[str]:
+            for acc in accounts:
+                t = (acc.get("account_type") or "").strip().lower()
+                if substr in t:
+                    return acc.get("account_number")
+            return None
+
+        if "saving" in label_norm:  # matches "savings", "saving"
+            # Prefer savings; if not found, fall back to primary
+            acct = find_by_type("saving")
+            return acct or primary
+
+        if "current" in label_norm or "checking" in label_norm:
+            return find_by_type("current") or find_by_type("checking")
+
+        # As a last resort, if label looks like a concrete account number, return as-is.
+        # This allows the LLM or user to supply explicit account numbers.
+        return label if label_norm.startswith("acc") or label_norm.isdigit() else None
 
     def get_tools(self) -> List[Tuple[str, str, str]]:
         """

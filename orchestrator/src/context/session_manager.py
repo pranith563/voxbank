@@ -35,6 +35,12 @@ class SessionManager:
             "session_id": session_id,
             "user_id": user_id,
             "username": None,
+            # Auth / profile flags
+            "is_authenticated": False,
+            "is_voice_verified": False,
+            # Simple cached profile info for tools/LLM
+            "primary_account": None,
+            "accounts": [],
             "created_at": now,
             "last_activity": now,
             # High-level chat history used by the orchestrator (role/text)
