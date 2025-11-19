@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from "react";
 import "./index.css";
-import VoiceSearchGeminiBrowser from "./VoiceSearchGeminiBrowser";
 import Register from "./Register";
+import VoiceSearchGeminiBrowser from "./VoiceSearchGeminiBrowser";
+import Login from "./Login";
 
 function generateSessionId() {
   if (typeof window !== "undefined" && "crypto" in window && "randomUUID" in window.crypto) {
@@ -11,7 +12,7 @@ function generateSessionId() {
 }
 
 function App() {
-  const [view, setView] = useState<"assistant" | "register">("assistant");
+  const [view, setView] = useState<"assistant" | "register" | "login">("assistant");
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string>(() => {
     if (typeof window === "undefined") return "local-session";
@@ -102,15 +103,34 @@ function App() {
               Assistant
             </button>
             <button
-              onClick={() => setView("register")}
+              onClick={() => {
+                if (!currentUser) {
+                  setView("register");
+                }
+              }}
               className={`px-3 py-1 text-xs rounded-full border hidden sm:inline-flex ${
                 view === "register"
                   ? "bg-white text-slate-800 border-white"
                   : "border-slate-400 text-slate-100"
               }`}
+              disabled={!!currentUser}
             >
               {currentUser ? currentUser : "Register"}
             </button>
+
+            {/* Login button (only when logged out) */}
+            {!currentUser && (
+              <button
+                onClick={() => setView("login")}
+                className={`px-3 py-1 text-xs rounded-full border hidden sm:inline-flex ${
+                  view === "login"
+                    ? "bg-white text-slate-800 border-white"
+                    : "border-slate-400 text-slate-100"
+                }`}
+              >
+                Login
+              </button>
+            )}
 
             {/* Settings button */}
             <button
@@ -139,12 +159,24 @@ function App() {
       {/* Main content: pad top so header doesn't overlap */}
       <main className="pt-20">
         <div className="max-w-6xl mx-auto px-6 py-12">
-          {view === "assistant" ? (
+          {view === "assistant" && (
             <VoiceSearchGeminiBrowser language={language} voiceType={voiceType} sessionId={sessionId} />
-          ) : (
+          )}
+          {view === "register" && (
             <Register
               sessionId={sessionId}
               onRegistered={(user) => {
+                if (user?.username) {
+                  setCurrentUser(user.username);
+                }
+                setView("assistant");
+              }}
+            />
+          )}
+          {view === "login" && (
+            <Login
+              sessionId={sessionId}
+              onLoggedIn={(user) => {
                 if (user?.username) {
                   setCurrentUser(user.username);
                 }
