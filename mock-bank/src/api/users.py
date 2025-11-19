@@ -4,7 +4,7 @@ from typing import List, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from db.models import User, Account
 from logging_config import get_logger
@@ -106,10 +106,14 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
     """
     Create a new user with username + passphrase (+ optional email and audio_embedding).
     """
-    logger.info("Creating user username=%s", payload.username)
+    # Normalise username/passphrase to lower-case for robustness with STT
+    username_norm = (payload.username or "").strip().lower()
+    passphrase_norm = (payload.passphrase or "").strip().lower()
+
+    logger.info("Creating user username=%s", username_norm)
 
     # Check if username already exists
-    stmt = select(User).where(User.username == payload.username)
+    stmt = select(User).where(func.lower(User.username) == username_norm)
     res = await db.execute(stmt)
     exists = res.scalars().first()
     if exists:
@@ -117,10 +121,10 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         raise HTTPException(status_code=409, detail="Username already exists")
 
     # Basic inferred email if not provided
-    email = payload.email or f"{payload.username}@example.com"
+    email = payload.email or f"{username_norm}@example.com"
 
     # For this prototype, we treat passphrase as the source for both passphrase and password_hash.
-    password_hash = payload.passphrase
+    password_hash = passphrase_norm
 
     # Determine audio_embedding:
     #  - If provided explicitly, trust it.
@@ -133,21 +137,21 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
             logger.info(
                 "create_user: computed audio embedding (len=%d) for username=%s",
                 len(audio_embedding or []),
-                payload.username,
+                username_norm,
             )
         except Exception as e:
             logger.exception("create_user: failed to decode audio_data: %s", e)
 
     u = User(
         user_id=uuid4(),
-        username=payload.username,
+        username=username_norm,
         email=email,
         password_hash=password_hash,
         full_name=payload.full_name,
         phone_number=payload.phone_number,
         address=payload.address,
         # date_of_birth is accepted as an ISO string; parsing can be added if needed.
-        passphrase=payload.passphrase,
+        passphrase=passphrase_norm,
         audio_embedding=audio_embedding,
     )
     db.add(u)
@@ -170,16 +174,19 @@ async def login(payload: LoginRequest, db=Depends(get_db)):
     """
     Validate username + passphrase and return basic auth info.
     """
-    logger.info("Login attempt username=%s", payload.username)
-    stmt = select(User).where(User.username == payload.username)
+    username_norm = (payload.username or "").strip().lower()
+    passphrase_norm = (payload.passphrase or "").strip().lower()
+
+    logger.info("Login attempt username=%s", username_norm)
+    stmt = select(User).where(func.lower(User.username) == username_norm)
     res = await db.execute(stmt)
     user = res.scalars().first()
     if not user:
-        logger.warning("Login failed - user not found username=%s", payload.username)
+        logger.warning("Login failed - user not found username=%s", username_norm)
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not user.passphrase or user.passphrase != payload.passphrase:
-        logger.warning("Login failed - invalid passphrase username=%s", payload.username)
+    if not user.passphrase or user.passphrase.lower() != passphrase_norm:
+        logger.warning("Login failed - invalid passphrase username=%s", username_norm)
         raise HTTPException(status_code=401, detail="Invalid passphrase")
 
     logger.info("Login successful user_id=%s username=%s", user.user_id, user.username)
@@ -229,4 +236,3 @@ async def get_audio_embedding(user_id: UUID, db=Depends(get_db)):
         raise HTTPException(status_code=404, detail="No audio embedding stored for this user")
 
     return AudioEmbeddingOut(user_id=user.user_id, audio_embedding=user.audio_embedding)
-

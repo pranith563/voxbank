@@ -12,10 +12,7 @@ function generateSessionId() {
 
 function App() {
   const [view, setView] = useState<"assistant" | "register">("assistant");
-  const [currentUser, setCurrentUser] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null;
-    return window.localStorage.getItem("voxbank_username");
-  });
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string>(() => {
     if (typeof window === "undefined") return "local-session";
     const existing = window.localStorage.getItem("voxbank_session_id");
@@ -29,13 +26,31 @@ function App() {
   const [language, setLanguage] = useState("en-US");
   const [voiceType, setVoiceType] = useState("default");
 
+  // On mount or when sessionId changes, ask orchestrator which user (if any)
+  // is associated with this session. This keeps frontend state in sync with
+  // server-side session/auth state.
   useEffect(() => {
-    if (currentUser) {
-      window.localStorage.setItem("voxbank_username", currentUser);
-    } else {
-      window.localStorage.removeItem("voxbank_username");
-    }
-  }, [currentUser]);
+    if (!sessionId) return;
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const resp = await fetch(`/api/session/me?session_id=${encodeURIComponent(sessionId)}`, {
+          method: "GET",
+          signal: controller.signal,
+        });
+        if (!resp.ok) return;
+        const json = await resp.json();
+        if (json?.authenticated && json.user?.username) {
+          setCurrentUser(json.user.username as string);
+        } else {
+          setCurrentUser(null);
+        }
+      } catch {
+        // best-effort; ignore network errors
+      }
+    })();
+    return () => controller.abort();
+  }, [sessionId]);
 
   function handleLogout() {
     // Inform orchestrator to clear auth state for this session (best-effort)
@@ -122,6 +137,7 @@ function App() {
             <VoiceSearchGeminiBrowser language={language} voiceType={voiceType} sessionId={sessionId} />
           ) : (
             <Register
+              sessionId={sessionId}
               onRegistered={(user) => {
                 if (user?.username) {
                   setCurrentUser(user.username);

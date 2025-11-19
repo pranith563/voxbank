@@ -10,7 +10,12 @@ interface RegisterProps {
   onRegistered?: (user: any) => void;
 }
 
-export default function Register({ onRegistered }: RegisterProps): JSX.Element {
+interface RegisterProps {
+  sessionId: string;
+  onRegistered?: (user: any) => void;
+}
+
+export default function Register({ sessionId, onRegistered }: RegisterProps): JSX.Element {
   const [username, setUsername] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [email, setEmail] = useState("");
@@ -80,19 +85,23 @@ export default function Register({ onRegistered }: RegisterProps): JSX.Element {
     setStatusMsg("Registering user...");
 
     try {
+      const usernameNorm = username.trim().toLowerCase();
+      const passphraseNorm = passphrase.trim().toLowerCase();
+
       const payload = {
-        username,
-        passphrase,
+        username: usernameNorm,
+        passphrase: passphraseNorm,
         email: email || null,
         full_name: fullName || null,
         phone_number: phoneNumber || null,
         address: address || null,
         date_of_birth: null,
         audio_data: audioBase64,
+        session_id: sessionId,
       };
 
-      // Call mock-bank register endpoint directly
-      const resp = await fetch("http://localhost:9000/api/register", {
+      // Call orchestrator auth register endpoint, which proxies to mock-bank
+      const resp = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

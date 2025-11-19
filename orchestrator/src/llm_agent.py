@@ -292,17 +292,20 @@ class LLMAgent:
     async def _find_mock_bank_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         """
         Deterministic lookup of a user by username using mock-bank API.
-        Uses GET /api/users and filters client-side.
+        Uses GET /api/list_users and filters client-side.
         """
         base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
         if not base:
             logger.warning("VOX_BANK_BASE_URL not configured; cannot validate username")
             return None
 
-        url = f"{base}/api/users"
+        username_norm = (username or "").strip().lower()
+
+        # list endpoint returns a list of users; we filter by username here
+        url = f"{base}/api/list_users"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url, params={"limit": 200})
+                resp = await client.get(url, params={"limit": 200, "offset": 0})
                 resp.raise_for_status()
                 users = resp.json()
         except Exception as e:
@@ -310,31 +313,24 @@ class LLMAgent:
             return None
 
         for u in users or []:
-            if u.get("username") == username:
-                logger.info("Auth: found existing mock-bank user %s -> %s", username, u.get("user_id"))
+            if (u.get("username") or "").strip().lower() == username_norm:
+                logger.info("Auth: found existing mock-bank user %s -> %s", username_norm, u.get("user_id"))
                 return u
-        logger.info("Auth: username %s not found in mock-bank", username)
+        logger.info("Auth: username %s not found in mock-bank", username_norm)
         return None
 
     async def _login_user_via_mcp_or_http(self, username: str, passphrase: str) -> Optional[Dict[str, Any]]:
         """
-        Validate username + passphrase via MCP `login_user` tool if available,
-        otherwise fall back to calling mock-bank /api/login directly.
+        Deterministic login helper: validate username + passphrase by calling
+        mock-bank /api/login directly.
+
         Returns a dict with at least user_id/username on success, or None on failure.
         """
-        # 1) Try MCP tool if mcp_client is wired
-        if self.mcp_client is not None:
-            try:
-                logger.info("AUTH: attempting MCP login_user for %s", username)
-                res = await self.mcp_client.call_tool("login_user", {"username": username, "passphrase": passphrase})
-                if res.get("status") in ("ok", "success") and res.get("user_id"):
-                    logger.info("AUTH: MCP login_user success for %s", username)
-                    return res
-                logger.warning("AUTH: MCP login_user failed for %s: %s", username, res)
-            except Exception as e:
-                logger.exception("AUTH: MCP login_user call failed for %s: %s", username, e)
+        # Normalise inputs to lower-case to be robust to STT case variation
+        username_norm = (username or "").strip().lower()
+        passphrase_norm = (passphrase or "").strip().lower()
 
-        # 2) Fallback: direct HTTP to mock-bank
+        # Direct HTTP to mock-bank
         base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
         if not base:
             logger.warning("VOX_BANK_BASE_URL not configured; cannot perform HTTP login")
@@ -343,16 +339,16 @@ class LLMAgent:
         url = f"{base}/api/login"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, json={"username": username, "passphrase": passphrase})
+                resp = await client.post(url, json={"username": username_norm, "passphrase": passphrase_norm})
                 if resp.status_code != 200:
-                    logger.warning("AUTH: HTTP login failed for %s: %s", username, resp.text)
+                    logger.warning("AUTH: HTTP login failed for %s: %s", username_norm, resp.text)
                     return None
                 data = resp.json()
                 if data.get("user_id"):
-                    logger.info("AUTH: HTTP login success for %s", username)
+                    logger.info("AUTH: HTTP login success for %s", username_norm)
                     return data
         except Exception as e:
-            logger.exception("AUTH: HTTP login call failed for %s: %s", username, e)
+            logger.exception("AUTH: HTTP login call failed for %s: %s", username_norm, e)
         return None
 
     async def _handle_auth_flow(self, transcript: str, session_id: str) -> Dict[str, Any]:
@@ -404,6 +400,8 @@ class LLMAgent:
             if not username:
                 username = words[-1]
 
+            username = username.strip().lower()
+
             # Avoid obvious non-usernames that come from echoing the assistant prompt
             if username.lower() in {"username", "user", "login"}:
                 msg = "Please say just your username, for example 'sowmy'."
@@ -434,7 +432,7 @@ class LLMAgent:
                 self._append_history(session_id, {"role": "assistant", "text": msg})
                 return {"status": "clarify", "message": msg}
 
-            username = state["temp"].get("username") or "user"
+            username = (state["temp"].get("username") or "user").strip().lower()
             login_res = await self._login_user_via_mcp_or_http(username, text)
             if not login_res:
                 msg = "The passphrase you provided doesn't match our records. Please try again."

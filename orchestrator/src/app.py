@@ -36,6 +36,8 @@ from voice_processing import (
     extract_voice_embedding,
 )
 
+VOX_BANK_BASE_URL = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
+
 
 
 # Pydantic models
@@ -82,6 +84,7 @@ class RegisterRequest(BaseModel):
     address: Optional[str] = None
     date_of_birth: Optional[str] = None  # ISO date string (not used by mock-bank today)
     audio_data: Optional[str] = None  # base64-encoded audio for embedding
+    session_id: Optional[str] = None  # orchestrator session to bind user to
 
 
 class RegisterResponse(BaseModel):
@@ -90,6 +93,12 @@ class RegisterResponse(BaseModel):
 
 
 class LogoutRequest(BaseModel):
+    session_id: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    passphrase: str
     session_id: str
 
 
@@ -212,6 +221,27 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/api/session/me")
+async def session_me(session_id: str) -> Dict[str, Any]:
+    """
+    Return the authenticated user (if any) for a given session_id.
+
+    This endpoint is used by the frontend on load to determine whether a
+    user is already logged in for the current session.
+    """
+    logger.info("API Request: GET /api/session/me | session_id=%s", session_id)
+    sess = session_manager.get_session(session_id)
+    if not sess or not sess.get("user_id"):
+        return {"authenticated": False, "user": None}
+    return {
+        "authenticated": True,
+        "user": {
+            "user_id": sess.get("user_id"),
+            "username": sess.get("username"),
+        },
+    }
+
+
 @app.post("/api/auth/logout")
 async def logout(req: LogoutRequest):
     """
@@ -225,6 +255,7 @@ async def logout(req: LogoutRequest):
     sess = session_manager.get_session(session_id)
     if sess:
         sess["user_id"] = None
+        sess["username"] = None
         sess["pending_action"] = None
         sess["pending_clarification"] = None
 
@@ -249,53 +280,124 @@ async def register_user(request: RegisterRequest):
     """
     Register a new VoxBank user.
 
-    - Optionally accepts `audio_data` (base64) and extracts a voice embedding.
-    - Calls MCP tool `register_user` to create the user in mock-bank.
+    This endpoint is deterministic and does NOT use the LLM.
+    It proxies to the mock-bank /api/register endpoint and, on success,
+    binds the returned user_id/username to the given session_id (if provided).
     """
     logger.info("API Request: POST /api/auth/register | username=%s", request.username)
 
-    # Prepare audio embedding if audio_data is provided
-    audio_embedding = None
-    if request.audio_data:
-        try:
-            import base64
+    base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+    if not base:
+        logger.error("VOX_BANK_BASE_URL is not configured; cannot register user")
+        raise HTTPException(status_code=500, detail="mock-bank base URL not configured")
 
-            audio_bytes = base64.b64decode(request.audio_data)
-            audio_embedding = await extract_voice_embedding(audio_bytes)
-            logger.info(
-                "Register: extracted voice embedding (len=%d) for username=%s",
-                len(audio_embedding or []),
-                request.username,
-            )
-        except Exception as e:
-            logger.exception("Register: failed to extract voice embedding: %s", e)
+    username_norm = (request.username or "").strip().lower()
+    passphrase_norm = (request.passphrase or "").strip().lower()
 
-    # Build payload for MCP register_user tool
     payload: Dict[str, Any] = {
-        "username": request.username,
-        "passphrase": request.passphrase,
+        "username": username_norm,
+        "passphrase": passphrase_norm,
         "email": request.email,
         "full_name": request.full_name,
         "phone_number": request.phone_number,
-        "audio_embedding": audio_embedding,
+        "address": request.address,
+        "date_of_birth": request.date_of_birth,
+        "audio_data": request.audio_data,
     }
 
     try:
-        mcp_client: MCPClient = app.state.mcp_client
-        logger.info("Register: calling MCP register_user for username=%s", request.username)
-        result = await mcp_client.call_tool("register_user", payload)
-        logger.info("Register: MCP register_user result status=%s", result.get("status"))
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = f"{base}/api/register"
+            logger.info("Register: calling mock-bank %s", url)
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                try:
+                    detail = resp.json().get("detail")
+                except Exception:
+                    detail = resp.text
+                logger.warning("Register: mock-bank error status=%s detail=%s", resp.status_code, detail)
+                raise HTTPException(status_code=resp.status_code, detail=detail or "Registration failed")
+            user = resp.json()
 
-        if result.get("status") != "success":
-            msg = result.get("message") or "Registration failed"
-            raise HTTPException(status_code=400, detail=msg)
+        # Bind session -> user if a session_id was provided
+        if request.session_id:
+            sess = session_manager.ensure_session(request.session_id, user_id=str(user.get("user_id")))
+            sess["username"] = (user.get("username") or username_norm)
+            # Keep LLMAgent auth_state in sync so tools can be used without conversational login
+            try:
+                agent: LLMAgent = app.state.agent
+                state = agent._get_auth_state(request.session_id)
+                state["authenticated"] = True
+                state["user_id"] = str(user.get("user_id"))
+                state["flow_stage"] = None
+                state["temp"] = {}
+            except Exception as e:
+                logger.exception("Register: failed to sync agent auth_state: %s", e)
 
-        user = result.get("user") or {}
         return RegisterResponse(status="success", user=user)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("Error in /api/auth/register: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/auth/login")
+async def login_user(request: LoginRequest) -> Dict[str, Any]:
+    """
+    Login endpoint for the frontend.
+
+    This validates credentials against mock-bank /api/login and, on success,
+    records {user_id, username} in the orchestrator session and LLMAgent auth_state.
+    """
+    logger.info("API Request: POST /api/auth/login | username=%s session_id=%s", request.username, request.session_id)
+
+    base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+    if not base:
+        logger.error("VOX_BANK_BASE_URL is not configured; cannot perform login")
+        raise HTTPException(status_code=500, detail="mock-bank base URL not configured")
+
+    username_norm = (request.username or "").strip().lower()
+    passphrase_norm = (request.passphrase or "").strip().lower()
+    payload = {"username": username_norm, "passphrase": passphrase_norm}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = f"{base}/api/login"
+            logger.info("Login: calling mock-bank %s", url)
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                try:
+                    detail = resp.json().get("detail")
+                except Exception:
+                    detail = resp.text
+                logger.warning("Login: mock-bank error status=%s detail=%s", resp.status_code, detail)
+                raise HTTPException(status_code=resp.status_code, detail=detail or "Login failed")
+            data = resp.json()
+
+        user_id = str(data.get("user_id"))
+        username = (data.get("username") or username_norm)
+
+        # Bind session state
+        sess = session_manager.ensure_session(request.session_id, user_id=user_id)
+        sess["username"] = username
+
+        # Sync LLMAgent auth state
+        try:
+            agent: LLMAgent = app.state.agent
+            state = agent._get_auth_state(request.session_id)
+            state["authenticated"] = True
+            state["user_id"] = user_id
+            state["flow_stage"] = None
+            state["temp"] = {}
+        except Exception as e:
+            logger.exception("Login: failed to sync agent auth_state: %s", e)
+
+        return {"status": "ok", "user": {"user_id": user_id, "username": username}, "session_id": request.session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in /api/auth/login: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -34,6 +34,7 @@ class SessionManager:
         session: Dict[str, Any] = {
             "session_id": session_id,
             "user_id": user_id,
+            "username": None,
             "created_at": now,
             "last_activity": now,
             # High-level chat history used by the orchestrator (role/text)
