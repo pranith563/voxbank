@@ -38,104 +38,20 @@ except ImportError:
 import math
 from decimal import Decimal
 
-from prompts.vox_assistant import (
-    TOOL_SPEC as FALLBACK_TOOL_SPEC,
-    PRELOGIN_PROMPT_TEMPLATE,
-    POSTLOGIN_PROMPT_TEMPLATE,
-    SYSTEM_PROMPT,
+from prompts.tool_spec import TOOL_SPEC as FALLBACK_TOOL_SPEC
+from prompts.decision_prelogin import PRELOGIN_PROMPT_TEMPLATE
+from prompts.decision_postlogin import POSTLOGIN_PROMPT_TEMPLATE
+from prompts.system_response import SYSTEM_PROMPT
+from agent_helpers import (
+    format_amount,
+    mask_account,
+    is_raw_tool_output,
+    render_history_for_prompt,
+    format_observation_for_history,
+    resolve_account_from_profile,
+    deterministic_fallback,
 )
 
-def _format_amount(self, value, currency="USD"):
-    """Return a nicely formatted amount string or None if invalid."""
-    if value is None:
-        return None
-    # Accept Decimal, int, float, numeric strings
-    try:
-        if isinstance(value, str):
-            # remove commas and currency symbols
-            v = re.sub(r"[^\d.\-]", "", value)
-            num = Decimal(v)
-        else:
-            num = Decimal(str(value))
-    except Exception:
-        return None
-    # If it's a whole number show no decimals, else show 2 decimal places
-    if num == num.to_integral():
-        return f"{num:.0f} {currency}"
-    else:
-        return f"{num.quantize(Decimal('0.01'))} {currency}"
-
-def _mask_account(self, acct: Optional[str]) -> Optional[str]:
-    """Return masked account like ACC***9001 or 'primary' unchanged."""
-    if not acct:
-        return None
-    acct = str(acct)
-    if acct.lower() in ("primary", "default"):
-        return acct
-    # keep last 4 digits, preserve prefix if exists
-    last4 = re.sub(r"\D", "", acct)[-4:]
-    prefix = acct.split(last4)[0] if last4 and last4 in acct else acct[:-4]
-    if prefix:
-        return f"{prefix}****{last4}"
-    return f"****{last4}"
-
-class KeywordIntentClassifier:
-    """
-    Simple fallback intent classifier using keyword matching and regex.
-    Returns: {"intent": str, "entities": dict, "confidence": float}
-    """
-
-    INTENT_KEYWORDS = {
-        "balance": ["balance", "how much", "account balance", "what's my balance", "abalance"],
-        "transfer": ["transfer", "send", "pay", "send money", "pay to"],
-        "transactions": ["transactions", "statement", "history", "last transactions", "show me my"],
-        "loan_inquiry": ["loan", "interest rate", "emi", "apply loan"],
-        "reminder": ["remind", "reminder", "set reminder"],
-        "greeting": ["hello", "hi", "hey", "good morning", "good evening"],
-        "goodbye": ["bye", "goodbye", "see you"]
-    }
-
-    AMOUNT_RE = re.compile(r"(?:₹|\bINR\s?)?([0-9]+(?:[.,][0-9]{1,2})?)")
-    PHONE_RE = re.compile(r"\b\d{10}\b")
-    ACCOUNT_RE = re.compile(r"(?:account|a/c|acct)\s*(?:no\.?|number)?\s*:? *([0-9\-xX*]{4,})")
-
-    async def classify(self, text: str) -> Dict[str, Any]:
-        tx = text.lower()
-        # detect intent by keywords
-        best_intent = "unknown"
-        for intent, keywords in self.INTENT_KEYWORDS.items():
-            for kw in keywords:
-                if kw in tx:
-                    best_intent = intent
-                    break
-            if best_intent != "unknown":
-                break
-
-        # simple entities
-        entities: Dict[str, Any] = {}
-        # amount
-        m = self.AMOUNT_RE.search(text.replace(",", ""))
-        if m:
-            try:
-                entities["amount"] = float(m.group(1))
-            except Exception:
-                entities["amount_raw"] = m.group(1)
-        # phone
-        m2 = self.PHONE_RE.search(text)
-        if m2:
-            entities["phone"] = m2.group(0)
-        # account
-        m3 = self.ACCOUNT_RE.search(text)
-        if m3:
-            entities["account_masked"] = m3.group(1)
-
-        # recipient name heuristic: "to <name>"
-        to_match = re.search(r"\bto\s+([A-Z][a-zA-Z]+\s?[A-Za-z]*)", text)
-        if to_match:
-            entities["recipient_name"] = to_match.group(1)
-
-        confidence = 0.6 if best_intent == "unknown" else 0.9
-        return {"intent": best_intent, "entities": entities, "confidence": confidence}
 
 class LLMAgent:
     """
@@ -241,36 +157,12 @@ class LLMAgent:
 
     # helper method to render history for the prompt (keeps prompt size manageable)
     def _render_history_for_prompt(self, session_id: str, max_messages: int = 8) -> str:
-        h = self.get_history(session_id) or []
-        if not h:
-            return ""
-        recent = h[-max_messages:]
-        lines = []
-        for m in recent:
-            role = m.get("role", "user")
-            text = m.get("text", "")
-            lines.append(f"{role}: {text}")
-        return "\n".join(lines)
-    
+        history = self.get_history(session_id) or []
+        return render_history_for_prompt(history, max_messages=max_messages)
+
     # helper to format observation stored in history (short summary)
     def _format_observation_for_history(self, tool_name: str, observation: Any) -> str:
-        try:
-            if isinstance(observation, dict):
-                # keep brief keys: status, message, balance, transactions count
-                if "balance" in observation:
-                    return f"{tool_name} -> balance: {observation.get('balance')} {observation.get('currency', '')}"
-                if "transactions" in observation and isinstance(observation.get("transactions"), list):
-                    return f"{tool_name} -> returned {len(observation.get('transactions'))} transactions"
-                if "status" in observation and observation.get("status") != "success":
-                    return f"{tool_name} -> status: {observation.get('status')} - {str(observation.get('message',''))}"
-                # fallback to short json snippet
-                short = json.dumps(observation, default=str)
-                return f"{tool_name} -> {short[:200]}"
-            if isinstance(observation, list):
-                return f"{tool_name} -> list length {len(observation)}"
-            return f"{tool_name} -> {str(observation)[:200]}"
-        except Exception:
-            return f"{tool_name} -> (unserializable observation)"
+        return format_observation_for_history(tool_name, observation)
 
     # -----------------------
     # Auth / login helpers
@@ -512,18 +404,7 @@ class LLMAgent:
         return {"status": "clarify", "message": msg}
     
     def _is_raw_tool_output(self, text: str) -> bool:
-        if not text or len(text) < 20:
-            return False
-        # heuristics
-        if re.search(r"\btransactions?\b", text, flags=re.I):
-            return True
-        if re.search(r"\bACC[0-9A-Za-z]{3,}\b", text):
-            return True
-        if re.search(r"^\s*[-\u2022]\s+", text, flags=re.M):  # bullet lines
-            return True
-        if re.search(r"\[.*?\]|\{.*?\}", text):
-            return True
-        return False
+        return is_raw_tool_output(text)
 
     async def decision(
         self,
@@ -541,7 +422,7 @@ class LLMAgent:
         """
         logger.info("=" * 80)
         logger.info("LLM DECISION - Starting")
-        logger.info("Context: %s | Transcript: %s", context, transcript)
+        logger.info("\nContext: %s ", context)
 
         # Determine authentication flag from explicit auth_state or session_profile
         if auth_state is None and session_profile is not None:
@@ -576,7 +457,7 @@ class LLMAgent:
                 if acct_types:
                     user_context_lines.append(f"- other_accounts: {', '.join(acct_types)}")
             user_context_block = "\n".join(user_context_lines) if user_context_lines else "- (none)"
-
+            logger.info("User Info: %s\n",user_context_block)
             prompt = (
                 self.postlogin_prompt_template
                 .replace("{history}", context)
@@ -1096,124 +977,9 @@ class LLMAgent:
 
     # Helper deterministic fallback method (add to the class)
     def _deterministic_fallback(self, intent: str, entities: Dict[str, Any], tool_result: Optional[Any]) -> str:
-        """
-        Deterministic safe messages when the LLM output is invalid or not trustworthy.
-        Keeps logic simple and predictable.
-        """
-        try:
-            # BALANCE
-            if intent == "balance" and isinstance(tool_result, dict):
-                bal = tool_result.get("balance") or tool_result.get("available_balance")
-                cur = tool_result.get("currency") or "USD"
-                bal_str = self._format_amount(bal, cur)
-                acct = self._mask_account(entities.get("account_number") or tool_result.get("account_number"))
-                if bal_str:
-                    return f"Your account {acct} has a balance of {bal_str}."
-
-            # TRANSACTIONS
-            if intent == "transactions":
-                if isinstance(tool_result, dict):
-                    txs = tool_result.get("transactions")
-                elif isinstance(tool_result, list):
-                    txs = tool_result
-                else:
-                    txs = None
-                if isinstance(txs, list) and len(txs) > 0:
-                    t = txs[0]
-                    amt = t.get("amount") or t.get("value")
-                    cur = t.get("currency") or t.get("currency_code") or ""
-                    # direction: debit if negative or type indicates debit
-                    try:
-                        direction = "debit" if (t.get("type") == "debit" or (amt is not None and float(amt) < 0)) else "credit"
-                    except Exception:
-                        direction = "debit" if t.get("type") == "debit" else "credit"
-                    desc = t.get("description") or t.get("merchant") or t.get("narration") or "a transaction"
-                    acct = self._mask_account(t.get("account") or entities.get("account_number") or tool_result.get("account_number"))
-                    amt_str = self._format_amount(amt, cur or "")
-                    if amt_str:
-                        return f"Your most recent transaction for {acct} was a completed {direction} of {amt_str} for '{desc}'."
-                return "I couldn't find any recent transactions. Would you like me to fetch more details?"
-
-            # TRANSFER - success or failure summary
-            if intent == "transfer" and isinstance(tool_result, dict):
-                status = tool_result.get("status")
-                if status == "success":
-                    amount = tool_result.get("amount") or entities.get("amount")
-                    cur = tool_result.get("currency") or "USD"
-                    amt_str = self._format_amount(amount, cur)
-                    recipient = tool_result.get("to") or entities.get("recipient_name") or entities.get("to_account_number") or "the recipient"
-                    ref = tool_result.get("txn_id") or tool_result.get("transaction_reference") or tool_result.get("reference")
-                    if amt_str:
-                        if ref:
-                            return f"Transfer of {amt_str} to {recipient} completed successfully. Reference: {ref}."
-                        return f"Transfer of {amt_str} to {recipient} completed successfully."
-                # failure case
-                if status in ("error", "failed") or tool_result.get("message"):
-                    msg = tool_result.get("message") or "The transfer could not be completed."
-                    return f"I couldn't complete the transfer: {msg}. Please check and try again."
-
-            # Generic fallback when no specific formatting applies
-            if isinstance(tool_result, dict) and tool_result.get("message"):
-                return str(tool_result.get("message"))
-
-        except Exception as e:
-            logger.exception("Exception in deterministic fallback: %s", e)
-
-        # ultimate generic fallback
-        return "I couldn't retrieve the information right now. Would you like me to try again?"
+        return deterministic_fallback(intent, entities, tool_result)
 
 
-    async def call_llm_deprecated(self, prompt: str, max_tokens: int = 256) -> str:
-        """
-        Wrapper around the LLM client. If a real llm_client is provided it will be used.
-        Otherwise we use the GeminiLLMClient fallback.
-        """
-        logger.debug("=" * 60)
-        logger.debug("CALL_LLM - Starting")
-        logger.debug("Prompt length: %d chars | Max tokens: %d", len(prompt), max_tokens)
-        
-        if not self.llm_client:
-            logger.warning("LLM client not set, attempting to create Gemini client...")
-            # Attempt to create a local Gemini client if possible
-            try:
-                self.llm_client = GeminiLLMClient(api_key=GEMINI_API_KEY, model=self.model_name)
-                logger.info("✓ Gemini client created")
-            except Exception as e:
-                logger.exception("Failed to create Gemini client: %s", e)
-                raise RuntimeError("No LLM client available and Gemini client could not be created")
-
-        try:
-            logger.info("Calling LLM generate()...")
-            text = await self.llm_client.generate(prompt, max_tokens=max_tokens)
-            logger.info("✓ LLM response received (length: %d chars)", len(str(text)))
-            
-            # ensure we return a string
-            if isinstance(text, str):
-                result = text.strip()
-                logger.debug("Response (string): %s", result[:300] + "..." if len(result) > 300 else result)
-                logger.debug("CALL_LLM - Complete")
-                logger.debug("=" * 60)
-                return result
-            # some clients return dict-like responses
-            if isinstance(text, dict):
-                logger.debug("Response (dict): %s", text)
-                # try common fields
-                result = (text.get("text") or text.get("content") or str(text)).strip()
-                logger.debug("Extracted text: %s", result[:300] + "..." if len(result) > 300 else result)
-                logger.debug("CALL_LLM - Complete")
-                logger.debug("=" * 60)
-                return result
-            result = str(text)
-            logger.debug("Response (other): %s", result[:300] + "..." if len(result) > 300 else result)
-            logger.debug("CALL_LLM - Complete")
-            logger.debug("=" * 60)
-            return result
-        except Exception as e:
-            logger.exception("LLM client error; falling back to safe message. %s", e)
-            logger.error("Prompt that failed: %s", prompt[:500] + "..." if len(prompt) > 500 else prompt)
-            logger.debug("CALL_LLM - Error")
-            logger.debug("=" * 60)
-            return "Sorry, I'm having trouble right now. Please try again in a moment."
 
     async def call_llm(
         self,
@@ -1285,55 +1051,4 @@ class LLMAgent:
         session_profile: Optional[Dict[str, Any]],
         label: Optional[str],
     ) -> Optional[str]:
-        """
-        Given a session_profile and an abstract label like "primary", "savings",
-        or "current", return a concrete account_number if possible.
-
-        This helper is intentionally small and logic-only so it can be unit-tested.
-        """
-        if not session_profile:
-            return None
-
-        primary = session_profile.get("primary_account")
-        accounts = session_profile.get("accounts") or []
-
-        if not label:
-            # No label -> use primary if available
-            return primary
-
-        label_norm = str(label).strip().lower()
-
-        # Primary / default
-        if label_norm in {"primary", "default", "my account", "my primary account"}:
-            return primary
-
-        # Savings / current mapping by account_type
-        def find_by_type(substr: str) -> Optional[str]:
-            for acc in accounts:
-                t = (acc.get("account_type") or "").strip().lower()
-                if substr in t:
-                    return acc.get("account_number")
-            return None
-
-        if "saving" in label_norm:  # matches "savings", "saving"
-            # Prefer savings; if not found, fall back to primary
-            acct = find_by_type("saving")
-            return acct or primary
-
-        if "current" in label_norm or "checking" in label_norm:
-            return find_by_type("current") or find_by_type("checking")
-
-        # As a last resort, if label looks like a concrete account number, return as-is.
-        # This allows the LLM or user to supply explicit account numbers.
-        return label if label_norm.startswith("acc") or label_norm.isdigit() else None
-
-    def get_tools(self) -> List[Tuple[str, str, str]]:
-        """
-        Return canonical list of tools (name, path, description) that this agent expects.
-        Used by orchestrator discovery if present.
-        """
-        return [
-            ("balance", "/tools/balance", "Get account balance by account number"),
-            ("transactions", "/tools/transactions", "Fetch recent transactions for an account"),
-            ("transfer", "/tools/transfer", "Execute a funds transfer (high-risk)")
-        ]
+        return resolve_account_from_profile(session_profile, label)
