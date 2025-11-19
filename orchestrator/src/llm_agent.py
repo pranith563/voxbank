@@ -382,8 +382,34 @@ class LLMAgent:
 
         # Stage 2: login - capture username and verify it exists
         if stage == "await_login_username":
-            # Very simple username extraction: use the last token or the raw text
-            username = text.split()[-1]
+            # Extract username from the utterance.
+            # Prefer patterns like "my username is sowmy", otherwise fall back to last token
+            # but avoid treating generic words like "username" or "login" as actual usernames.
+            words = text.split()
+            if not words:
+                msg = "I didn't catch your username. Please say just your username, like 'sowmy'."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            # Simple pattern: "... username is <value>"
+            username = None
+            for marker in ["username is", "user name is", "my name is", "i am"]:
+                if marker in lower:
+                    # take the text after the marker as the candidate
+                    candidate = lower.split(marker, 1)[1].strip()
+                    if candidate:
+                        username = candidate.split()[0]
+                        break
+
+            if not username:
+                username = words[-1]
+
+            # Avoid obvious non-usernames that come from echoing the assistant prompt
+            if username.lower() in {"username", "user", "login"}:
+                msg = "Please say just your username, for example 'sowmy'."
+                self._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
             state["temp"]["username"] = username
             logger.info("AUTH: login username candidate=%s", username)
 
@@ -494,7 +520,14 @@ class LLMAgent:
             return True
         return False
 
-    async def decision(self, transcript: str, context: str, observation: Optional[Any] = None, max_tokens: int = 512) -> dict:
+    async def decision(
+        self,
+        transcript: str,
+        context: str,
+        observation: Optional[Any] = None,
+        auth_state: Optional[bool] = None,
+        max_tokens: int = 512,
+    ) -> dict:
         """
         Ask the LLM to *decide* action: respond, call_tool, ask_user, or ask_confirmation.
         Returns parsed JSON dict with keys: action, intent, requires_tool, tool_name, tool_input,
@@ -505,7 +538,14 @@ class LLMAgent:
         logger.info("Context: %s | Transcript: %s", context, transcript)
         
         # add context/history to the prompt, tools_block too
-        prompt = self.prompt_template.replace("{history}", context).replace("{tools_block}", self.tools_block).strip()
+        auth_str = "true" if auth_state else "false"
+        prompt = (
+            self.prompt_template
+            .replace("{history}", context)
+            .replace("{tools_block}", self.tools_block)
+            .replace("{auth_state}", auth_str)
+            .strip()
+        )
 
         # Add the user request at the end
         prompt = f"{prompt}\n\nUser request: \"{transcript}\"\n"
@@ -647,14 +687,42 @@ class LLMAgent:
         
         
 
-        # If we are currently in a login / registration flow, handle it
         auth_state = self._get_auth_state(session_id)
+        # If we are currently in a login / registration flow, handle it
         if auth_state.get("flow_stage"):
             logger.info("ORCHESTRATE: routing input to auth flow (stage=%s)", auth_state.get("flow_stage"))
             result = await self._handle_auth_flow(transcript, session_id)
             logger.info("ORCHESTRATE: auth flow handled with status=%s", result.get("status"))
             logger.info("=" * 80)
             return result
+
+        # If the session is unauthenticated and the user explicitly mentions login/registration
+        # in this utterance, route directly into the deterministic auth flow instead of asking
+        # the LLM to interpret it. This prevents the assistant from looping on generic
+        # "please log in" messages without actually starting the login dialogue.
+        if not self.is_authenticated(session_id):
+            lower_tx = (transcript or "").lower()
+            login_keywords = [
+                "login",
+                "log in",
+                "sign in",
+            ]
+            register_keywords = [
+                "register",
+                "sign up",
+                "create account",
+                "open account",
+            ]
+            if any(kw in lower_tx for kw in login_keywords + register_keywords):
+                logger.info(
+                    "ORCHESTRATE: detected explicit login/register intent in transcript; "
+                    "routing to auth flow with stage=%s",
+                    auth_state.get("flow_stage") or "await_choice",
+                )
+                result = await self._handle_auth_flow(transcript, session_id)
+                logger.info("ORCHESTRATE: auth flow handled with status=%s", result.get("status"))
+                logger.info("=" * 80)
+                return result
 
         iterations = 0
         parsed = None
@@ -667,8 +735,15 @@ class LLMAgent:
             iterations += 1
             logger.info("ReAct loop iteration %d/%d", iterations, max_iterations)
 
-            # Call decision with current transcript + context and last observation (if any)
-            parsed = await self.decision(transcript, self._render_history_for_prompt(session_id), observation=observation)
+            # Call decision with current transcript + context, auth state, and last observation (if any)
+            context_str = self._render_history_for_prompt(session_id)
+            auth_flag = self.is_authenticated(session_id)
+            parsed = await self.decision(
+                transcript,
+                context_str,
+                observation=observation,
+                auth_state=auth_flag,
+            )
             self._append_history(session_id, {"role": "user", "text": transcript})
             logger.debug("Added user message to history")
             action = parsed.get("action")
@@ -681,6 +756,34 @@ class LLMAgent:
 
             logger.info("Decision (iter %d): action=%s intent=%s tool=%s requires_confirmation=%s", iterations, action, intent, tool_name, requires_confirmation)
             logger.debug("Parsed: %s", parsed)
+
+            # Hard guard: if the session is not authenticated and the intent is
+            # clearly account-specific, never allow a direct LLM response.
+            # This prevents hallucinated balances/transactions when session_authenticated is false.
+            unauthenticated = not self.is_authenticated(session_id)
+            account_intents = {"balance", "transactions", "transfer"}
+            account_tools = {"balance", "transactions", "transfer"}
+            if (
+                unauthenticated
+                and action == "respond"
+                and (
+                    (intent in account_intents)
+                    or (requires_tool and tool_name in account_tools)
+                )
+            ):
+                state = self._get_auth_state(session_id)
+                if not state.get("flow_stage"):
+                    state["flow_stage"] = "await_choice"
+                login_msg = "You're not logged in yet. Please login or register before I can access your accounts."
+                self._append_history(session_id, {"role": "assistant", "text": login_msg})
+                logger.info(
+                    "ORCHESTRATE - Blocked unauthenticated account-level respond action for session %s (intent=%s, tool=%s)",
+                    session_id,
+                    intent,
+                    tool_name,
+                )
+                logger.info("=" * 80)
+                return {"status": "clarify", "message": login_msg}
 
             # If decision requests to ask user / confirm -> return immediately (assistant message already prepared)
             if action in ("ask_user", "ask_confirmation"):

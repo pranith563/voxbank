@@ -331,6 +331,9 @@ export default function VoiceSearchGeminiBrowser({
     }
 
     setAgentMode("thinking");
+    // Show only the new chunk in captions and chat so UI stays readable.
+    setTranscript(newText);
+    setInterim("");
     setChatMessages((prev) => [...prev, { role: "user", text: newText }]);
     console.log("[Send] sent new text:", newText);
     lastSentCharIndexRef.current = full.length;
@@ -348,6 +351,13 @@ export default function VoiceSearchGeminiBrowser({
       setRecognitionSupported(false);
       return;
     }
+
+    // Reset transcript state for a new listening session so captions and
+    // payloads only reflect this turn, not the whole conversation.
+    finalTranscriptRef.current = "";
+    lastSentCharIndexRef.current = 0;
+    setTranscript("");
+    setInterim("");
 
     // if already running, nothing to do
     if (recognitionRef.current && listeningRef.current) {
@@ -373,10 +383,15 @@ export default function VoiceSearchGeminiBrowser({
 
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const res = event.results[i];
+        const chunk = (res[0]?.transcript || "").trim();
+        if (!chunk) continue;
         if (res.isFinal) {
-          finalAccum += (res[0]?.transcript || "");
+          if (finalAccum && !finalAccum.endsWith(" ")) {
+            finalAccum += " ";
+          }
+          finalAccum += chunk;
         } else {
-          interimAccum += (res[0]?.transcript || "");
+          interimAccum += chunk;
         }
       }
 
