@@ -103,3 +103,19 @@ class AudioEmbeddingOut(BaseModel):
     user_id: UUID
     audio_embedding: Any
 
+
+class BeneficiaryOut(BaseModel):
+    beneficiary_id: UUID
+    user_id: UUID
+    nickname: Optional[str] = None
+    account_number: str
+    bank_name: Optional[str] = None
+    is_internal: bool = True
+
+
+class BeneficiaryCreate(BaseModel):
+    nickname: Optional[str] = None
+    account_number: str
+    bank_name: Optional[str] = None
+    is_internal: bool = True
+

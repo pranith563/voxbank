@@ -1,6 +1,6 @@
 from typing import Any, Dict
 
-from db.models import User, Account, Transaction
+from db.models import User, Account, Transaction, Beneficiary
 
 
 def serialize_user(u: User) -> Dict[str, Any]:
@@ -55,5 +55,16 @@ def serialize_tx(t: Transaction) -> Dict[str, Any]:
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if getattr(t, "updated_at", None) else None,
         "completed_at": t.completed_at.isoformat() if getattr(t, "completed_at", None) else None,
+    }
+
+
+def serialize_beneficiary(b: Beneficiary) -> Dict[str, Any]:
+    return {
+        "beneficiary_id": str(b.beneficiary_id),
+        "user_id": str(b.user_id),
+        "nickname": b.nickname,
+        "account_number": b.beneficiary_account_number,
+        "bank_name": b.bank_name,
+        "is_internal": bool(b.is_internal),
     }
 

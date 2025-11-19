@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import select, func
 
-from db.models import User, Account
+from db.models import User, Account, Beneficiary
 from logging_config import get_logger
 from .deps import get_db
 from .schemas import (
@@ -18,8 +18,10 @@ from .schemas import (
     UserCreate,
     UserOut,
     AccountOut,
+    BeneficiaryOut,
+    BeneficiaryCreate,
 )
-from .serializers import serialize_account, serialize_user
+from .serializers import serialize_account, serialize_user, serialize_beneficiary
 
 logger = get_logger("mock_bank.api.users")
 
@@ -279,3 +281,100 @@ async def get_audio_embedding(user_id: UUID, db=Depends(get_db)):
         raise HTTPException(status_code=404, detail="No audio embedding stored for this user")
 
     return AudioEmbeddingOut(user_id=user.user_id, audio_embedding=user.audio_embedding)
+
+
+@router.get("/users/{user_id}/beneficiaries", response_model=List[BeneficiaryOut])
+async def get_user_beneficiaries(
+    user_id: UUID,
+    limit: int = 50,
+    offset: int = 0,
+    db=Depends(get_db),
+):
+    """
+    Return a paginated list of beneficiaries (saved payees) for a user.
+    """
+    logger.info("Fetching beneficiaries for user_id=%s limit=%s offset=%s", user_id, limit, offset)
+    # Ensure user exists
+    stmt_user = select(User).where(User.user_id == user_id)
+    res_user = await db.execute(stmt_user)
+    u = res_user.scalars().first()
+    if not u:
+        logger.warning("User not found when fetching beneficiaries user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stmt = (
+        select(Beneficiary)
+        .where(Beneficiary.user_id == user_id)
+        .order_by(Beneficiary.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    res = await db.execute(stmt)
+    beneficiaries = res.scalars().all()
+    return [serialize_beneficiary(b) for b in beneficiaries]
+
+
+@router.post("/users/{user_id}/beneficiaries", response_model=BeneficiaryOut)
+async def create_beneficiary_for_user(
+    user_id: UUID,
+    payload: BeneficiaryCreate,
+    db=Depends(get_db),
+):
+    """
+    Create a new beneficiary (saved payee) for the given user.
+    """
+    logger.info(
+        "Creating beneficiary for user_id=%s nickname=%s account_number=%s",
+        user_id,
+        payload.nickname,
+        payload.account_number,
+    )
+    # Ensure user exists
+    stmt_user = select(User).where(User.user_id == user_id)
+    res_user = await db.execute(stmt_user)
+    u = res_user.scalars().first()
+    if not u:
+        logger.warning("User not found when creating beneficiary user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Optional duplicate check: avoid duplicates per (user_id, account_number)
+    stmt_dup = select(Beneficiary).where(
+        Beneficiary.user_id == user_id,
+        Beneficiary.beneficiary_account_number == payload.account_number,
+    )
+    res_dup = await db.execute(stmt_dup)
+    existing = res_dup.scalars().first()
+    if existing:
+        logger.warning(
+            "Beneficiary already exists for user_id=%s account_number=%s",
+            user_id,
+            payload.account_number,
+        )
+        raise HTTPException(status_code=409, detail="Beneficiary already exists for this account number")
+
+    nickname = payload.nickname or None
+    # For now, beneficiary_name mirrors nickname if provided, else falls back to account_number
+    beneficiary_name = nickname or payload.account_number
+
+    b = Beneficiary(
+        beneficiary_id=uuid4(),
+        user_id=user_id,
+        beneficiary_account_number=payload.account_number,
+        beneficiary_name=beneficiary_name,
+        nickname=nickname,
+        bank_name=payload.bank_name,
+        is_internal=payload.is_internal,
+        status="active",
+    )
+    db.add(b)
+    await db.commit()
+    await db.refresh(b)
+
+    logger.info(
+        "Created beneficiary beneficiary_id=%s user_id=%s nickname=%s account_number=%s",
+        b.beneficiary_id,
+        user_id,
+        b.nickname,
+        b.beneficiary_account_number,
+    )
+    return serialize_beneficiary(b)

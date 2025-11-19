@@ -72,3 +72,19 @@ class Transaction(Base):
     created_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
     completed_at = Column(TIMESTAMP)
+
+
+class Beneficiary(Base):
+    __tablename__ = "beneficiaries"
+
+    beneficiary_id = Column(UUID(as_uuid=True), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    beneficiary_account_number = Column(String(20), nullable=False)
+    beneficiary_name = Column(String(255), nullable=False)
+    nickname = Column(String(100), nullable=True)
+    bank_name = Column(String(255), nullable=True)
+    bank_code = Column(String(20), nullable=True)
+    is_internal = Column(Boolean, default=True)
+    status = Column(String(20))
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)

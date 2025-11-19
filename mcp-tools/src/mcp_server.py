@@ -104,6 +104,28 @@ TOOL_METADATA = {
             "user_id": {"type": "string", "required": True},
         },
     },
+    "get_user_beneficiaries": {
+        "description": "List all beneficiaries (saved payees) for a given user_id",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+        },
+    },
+    "add_beneficiary": {
+        "description": "Add a new beneficiary (saved payee) for a user",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+            "nickname": {"type": "string", "required": False},
+            "account_number": {"type": "string", "required": True},
+            "bank_name": {"type": "string", "required": False},
+            "is_internal": {"type": "boolean", "required": False},
+        },
+    },
+    "get_user_accounts": {
+        "description": "Fetch all accounts for a user by user_id",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+        },
+    },
     "list_tools": {
         "description": "List available MCP tools",
         "params": {},
@@ -363,6 +385,73 @@ async def get_user_profile(user_id: str) -> dict:
     return {"status": "success", "user": result["data"]}
 
 
+@mcp.tool(name="get_user_accounts", description="Fetch all accounts for a user by user_id")
+async def get_user_accounts(user_id: str) -> dict:
+    """
+    Wraps GET /api/users/{user_id}/accounts and returns the list of accounts.
+    """
+    url = _mock_bank_url(f"/api/users/{user_id}/accounts")
+    result = await _get_json(url)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    return {"status": "success", "accounts": result["data"]}
+
+
+@mcp.tool(name="get_user_beneficiaries", description="List beneficiaries for a user")
+async def get_user_beneficiaries(user_id: str, limit: int = 50, offset: int = 0) -> dict:
+    """
+    Wraps GET /api/users/{user_id}/beneficiaries.
+    """
+    url = _mock_bank_url(f"/api/users/{user_id}/beneficiaries")
+    result = await _get_json(url, params={"limit": limit, "offset": offset})
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "beneficiaries": result["data"],
+    }
+
+
+@mcp.tool(name="add_beneficiary", description="Add a new beneficiary for a user")
+async def add_beneficiary(
+    user_id: str,
+    account_number: str,
+    nickname: str | None = None,
+    bank_name: str | None = None,
+    is_internal: bool = True,
+) -> dict:
+    """
+    Wraps POST /api/users/{user_id}/beneficiaries.
+    """
+    url = _mock_bank_url(f"/api/users/{user_id}/beneficiaries")
+    payload = {
+        "account_number": account_number,
+        "nickname": nickname,
+        "bank_name": bank_name,
+        "is_internal": is_internal,
+    }
+    result = await _post_json(url, payload)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    return {"status": "success", "beneficiary": result["data"]}
+
+
 @mcp.tool(name="list_tools", description="List available MCP tools")
 def list_tools() -> dict:
     """Return metadata for all available MCP tools."""
@@ -391,4 +480,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
