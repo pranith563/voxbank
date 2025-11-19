@@ -22,6 +22,20 @@ TOOL_SPEC = {
             "initiated_by_user_id": {"type": "string", "required": False},
             "reference": {"type": "string", "required": False}
         }
+    },
+    "get_user_beneficiaries": {
+        "description": "List all beneficiaries (saved payees) for the currently logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True}
+        }
+    },
+    "add_beneficiary": {
+        "description": "Add a new beneficiary (saved payee) for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+            "nickname": {"type": "string", "required": False},
+            "account_number": {"type": "string", "required": True}
+        }
     }
 }
 
@@ -89,6 +103,41 @@ TOOL_SPEC_V2 = {
             {"user_query": "Send $50 from my primary to savings", "tool_input": {"from_account_number": "ACC002002", "to_account_number": "ACC002001", "amount": 50, "currency": "USD"}},
             {"user_query": "transfer 1000 INR to ACC98765", "tool_input": {"from_account_number": "ACC08765", "to_account_number": "ACC98765", "amount": 1000, "currency": "INR"}}
         ]
+    },
+    "get_user_beneficiaries": {
+        "description": "List all beneficiaries (saved payees) for a logged-in user.",
+        "params": {
+            "user_id": {
+                "type": "string",
+                "required": True,
+                "description": "The logged in user's ID."
+            }
+        },
+        "examples": [
+            {"user_query": "Who have I saved as payees?", "tool_input": {"user_id": "USER_UUID"}}
+        ]
+    },
+    "add_beneficiary": {
+        "description": "Add a new beneficiary (saved payee) for the logged-in user.",
+        "params": {
+            "user_id": {
+                "type": "string",
+                "required": True,
+                "description": "The logged in user's ID."
+            },
+            "nickname": {
+                "type": "string",
+                "required": False,
+                "description": "Friendly name for the beneficiary, e.g. 'John' or 'Rent'."
+            },
+            "account_number": {
+                "type": "string",
+                "required": True,
+                "description": "The beneficiary's account number."
+            }
+        },
+        "examples": [
+            {"user_query": "Save John as a beneficiary", "tool_input": {"user_id": "USER_UUID", "nickname": "John", "account_number": "ACC002001"}}
+        ]
     }
 }
-

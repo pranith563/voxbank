@@ -16,6 +16,12 @@ When you choose to call a tool, produce `tool_name` and `tool_input` that match 
 
 Use USER CONTEXT and conversation history to resolve phrases like "my account", "my savings account", or "primary account" to the correct logical account. For any actual balances or transactions, always call tools; do not guess values.
 
+When the user asks to send money to a named person (e.g. "John", "Mom", "Rent") instead of an account number:
+- First, if you know the logged-in user_id, call `get_user_beneficiaries` with that user_id to fetch saved beneficiaries.
+- If a beneficiary nickname matches the requested name (case-insensitive), use its `account_number` when calling the `transfer` tool.
+- If no beneficiary matches, set action = "ask_user" and ask for the recipient's account number.
+- After a successful transfer, you MAY call `add_beneficiary` ONLY if the user has explicitly asked you to save this recipient as a beneficiary (e.g. "save John for next time").
+
 Return ONLY a single JSON object (no extra text) with the exact fields described in the JSON schema below.
 
 TOOLS:
@@ -74,4 +80,3 @@ User: "Send 50 USD from my primary to ACC12345"
 
 END
 """
-

@@ -1,8 +1,8 @@
 """
-agent_helpers.py
+Shared utilities for VoxBank agent and orchestrator.
 
-Utility helpers for LLMAgent to keep llm_agent.py focused on core
-decision / orchestration logic.
+This file centralizes formatting, history rendering, and prompt-assembly
+helpers so that the main classes stay focused on core logic.
 """
 
 from typing import Any, Dict, List, Optional
@@ -66,7 +66,7 @@ def is_raw_tool_output(text: str) -> bool:
     return False
 
 
-def render_history_for_prompt(history: List[Dict[str, Any]], max_messages: int = 8) -> str:
+def render_history_for_prompt(history: List[Dict[str, Any]], max_messages: int = 40) -> str:
     """
     Render a short text block from recent conversation history for use
     inside the decision prompt.
@@ -207,3 +207,104 @@ def deterministic_fallback(
         logger.exception("deterministic_fallback: error while building fallback response")
 
     return "I'm having trouble generating a safe response right now. Please try again or rephrase your request."
+
+
+def build_user_context_block(session_profile: Optional[Dict[str, Any]]) -> str:
+    """
+    Build a compact USER CONTEXT block for the decision prompt from a
+    session_profile structure.
+    """
+    if not session_profile:
+        return "- (none)"
+
+    lines: List[str] = []
+    lines.append(f"- user_id: {session_profile.get('user_id')}")
+    lines.append(f"- username: {session_profile.get('username')}")
+
+    primary_acct = session_profile.get("primary_account")
+    lines.append(f"- primary_account: {primary_acct}")
+
+    profile = session_profile.get("user_profile") or {}
+    full_name = profile.get("full_name")
+    if full_name:
+        lines.append(f"- full_name: {full_name}")
+    email = profile.get("email")
+    if email:
+        lines.append(f"- email: {email}")
+    phone = profile.get("phone_number")
+    if phone:
+        lines.append(f"- phone_number: {phone}")
+    preferred_lang = profile.get("preferred_language")
+    if preferred_lang:
+        lines.append(f"- preferred_language: {preferred_lang}")
+    kyc_status = profile.get("kyc_status")
+    if kyc_status:
+        lines.append(f"- kyc_status: {kyc_status}")
+    status = profile.get("status")
+    if status:
+        lines.append(f"- customer_status: {status}")
+    address = profile.get("address")
+    if address:
+        lines.append(f"- address: {address}")
+    dob = profile.get("date_of_birth")
+    if dob:
+        lines.append(f"- date_of_birth: {dob}")
+    last_active = profile.get("last_active")
+    if last_active:
+        lines.append(f"- last_active: {last_active}")
+    has_audio_embedding = profile.get("has_audio_embedding")
+    if has_audio_embedding is not None:
+        lines.append(f"- has_voice_print: {bool(has_audio_embedding)}")
+
+    accounts = session_profile.get("accounts") or []
+    acct_types: List[str] = []
+    for acc in accounts:
+        t = (acc.get("account_type") or "").strip().lower()
+        if t and t not in acct_types:
+            acct_types.append(t)
+    if acct_types:
+        lines.append(f"- other_accounts: {', '.join(acct_types)}")
+
+    # Include a brief accounts summary (up to 3 accounts) for more context
+    if accounts:
+        summaries: List[str] = []
+        for acc in accounts[:3]:
+            acct_num = acc.get("account_number")
+            acct_type = (acc.get("account_type") or "").strip().lower() or "account"
+            curr = acc.get("currency") or ""
+            label = f"{acct_type} ({acct_num})"
+            if curr:
+                label = f"{label} {curr}"
+            summaries.append(label)
+        lines.append(f"- accounts_summary: {', '.join(summaries)}")
+
+    # Beneficiary summary if present
+    beneficiaries = session_profile.get("beneficiaries") or []
+    if beneficiaries:
+        names: List[str] = []
+        for b in beneficiaries[:3]:
+            nick = b.get("nickname") or b.get("beneficiary_name") or b.get("account_number")
+            acct = b.get("account_number")
+            if acct:
+                names.append(f"{nick} ({acct})")
+            else:
+                names.append(str(nick))
+        lines.append(f"- saved_beneficiaries: {', '.join(names)}")
+
+    return "\n".join(lines) if lines else "- (none)"
+
+
+def build_tools_block(tool_spec: Dict[str, Any]) -> str:
+    """
+    Build a TOOLS block description from MCP tool metadata.
+    """
+    lines: List[str] = []
+    for name, meta in (tool_spec or {}).items():
+        params_meta = meta.get("params", {}) or {}
+        params = ", ".join(
+            f"{p} (required)" if (p_meta or {}).get("required") else f"{p} (optional)"
+            for p, p_meta in params_meta.items()
+        )
+        desc = meta.get("description", "")
+        lines.append(f"- {name}: {desc} Params: {params}")
+    return "\n".join(lines)

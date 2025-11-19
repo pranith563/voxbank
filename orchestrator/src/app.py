@@ -25,7 +25,8 @@ setup_logging()
 # Logging
 logger = get_logger("voxbank.orchestrator")
 
-from llm_agent import LLMAgent
+from agent.agent import VoxBankAgent
+from agent.orchestrator import ConversationOrchestrator
 from gemini_llm_client import GeminiLLMClient
 from clients.mcp_client import MCPClient
 from context.session_manager import SessionManager
@@ -142,6 +143,7 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
             "is_voice_verified": False,
             "primary_account": None,
             "accounts": [],
+            "beneficiaries": [],
         }
 
     profile = {
@@ -151,6 +153,8 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
         "is_voice_verified": bool(sess.get("is_voice_verified")),
         "primary_account": sess.get("primary_account"),
         "accounts": sess.get("accounts") or [],
+        "beneficiaries": sess.get("beneficiaries") or [],
+        "user_profile": sess.get("user_profile") or {},
     }
     logger.info(
         "Session profile for %s -> user_id=%s username=%s primary_account=%s accounts=%d",
@@ -165,82 +169,219 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
 
 async def hydrate_session_profile_from_mock_bank(session_id: str, user_id: str) -> None:
     """
-    Fetch user profile + accounts from mock-bank and cache them on the session.
+    Fetch user profile + accounts (and beneficiaries) from mock-bank and cache
+    them on the session.
 
     This is used after a successful login (either via HTTP login endpoint or
     conversational auth) so that subsequent LLM/tool calls can rely on a
     populated session_profile.
     """
-    base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
-    if not base:
-        logger.error("hydrate_session_profile: VOX_BANK_BASE_URL not configured; cannot hydrate profile")
-        return
-
     accounts_compact: list[Dict[str, Any]] = []
+    beneficiaries: list[Dict[str, Any]] = []
     primary_account: Optional[str] = None
 
     profile_data: Dict[str, Any] = {}
 
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            profile_url = f"{base}/api/users/{user_id}"
-            accounts_url = f"{base}/api/users/{user_id}/accounts"
-
-            logger.info("hydrate_session_profile: fetching profile from %s", profile_url)
-            try:
-                profile_resp = await client.get(profile_url)
-                profile_resp.raise_for_status()
-                profile_data = profile_resp.json() or {}
+    # Prefer MCP tools for profile + accounts (+ beneficiaries)
+    mcp = getattr(app.state, "mcp_client", None)
+    if mcp is not None:
+        logger.info(
+            "hydrate_session_profile: using MCP tools get_user_profile/get_user_accounts for user_id=%s",
+            user_id,
+        )
+        # Fetch profile via MCP (FastMCP returns CallToolResult; HTTP fallback returns dict)
+        try:
+            prof_res = await mcp.call_tool("get_user_profile", {"user_id": user_id})
+            prof_payload = getattr(prof_res, "data", prof_res)
+            if isinstance(prof_payload, dict) and prof_payload.get("status") == "success":
+                profile_data = prof_payload.get("user") or {}
                 logger.info(
-                    "hydrate_session_profile: profile fetch successful for user_id=%s username=%s",
+                    "hydrate_session_profile: MCP profile fetch successful for user_id=%s username=%s",
                     user_id,
                     profile_data.get("username"),
                 )
-            except Exception as e:
-                logger.warning("hydrate_session_profile: profile fetch failed for user_id=%s error=%s", user_id, e)
-
-            logger.info("hydrate_session_profile: fetching accounts from %s", accounts_url)
-            try:
-                accounts_resp = await client.get(accounts_url)
-                accounts_resp.raise_for_status()
-                accounts_full = accounts_resp.json() or []
-
-                for acc in accounts_full:
-                    acct_num = acc.get("account_number")
-                    if not acct_num:
-                        continue
-                    accounts_compact.append(
-                        {
-                            "account_number": acct_num,
-                            "account_type": acc.get("account_type"),
-                            "currency": acc.get("currency"),
-                        }
-                    )
-                # Decide primary account: prefer savings, else first
-                for acc in accounts_full:
-                    if (acc.get("account_type") or "").strip().lower() == "savings":
-                        primary_account = acc.get("account_number")
-                        break
-                if not primary_account and accounts_full:
-                    primary_account = accounts_full[0].get("account_number")
-
-                logger.info(
-                    "hydrate_session_profile: cached %d accounts for user_id=%s primary_account=%s",
-                    len(accounts_compact),
+            else:
+                logger.warning(
+                    "hydrate_session_profile: MCP get_user_profile returned non-success for user_id=%s: %s",
                     user_id,
-                    primary_account,
+                    prof_res,
                 )
+        except Exception as e:
+            logger.exception("hydrate_session_profile: MCP get_user_profile failed for user_id=%s error=%s", user_id, e)
+
+        # Fetch accounts via MCP
+        accounts_full: list[Dict[str, Any]] = []
+        try:
+            acc_res = await mcp.call_tool("get_user_accounts", {"user_id": user_id})
+            acc_payload = getattr(acc_res, "data", acc_res)
+            if isinstance(acc_payload, dict) and acc_payload.get("status") == "success":
+                accounts_full = acc_payload.get("accounts") or []
+            else:
+                logger.warning(
+                    "hydrate_session_profile: MCP get_user_accounts returned non-success for user_id=%s: %s",
+                    user_id,
+                    acc_res,
+                )
+        except Exception as e:
+            logger.exception("hydrate_session_profile: MCP get_user_accounts failed for user_id=%s error=%s", user_id, e)
+
+        # Fetch beneficiaries via MCP (optional, for richer USER CONTEXT)
+        try:
+            ben_res = await mcp.call_tool("get_user_beneficiaries", {"user_id": user_id})
+            ben_payload = getattr(ben_res, "data", ben_res)
+            if isinstance(ben_payload, dict) and ben_payload.get("status") == "success":
+                beneficiaries = ben_payload.get("beneficiaries") or []
+                logger.info(
+                    "hydrate_session_profile: MCP beneficiary fetch successful for user_id=%s count=%d",
+                    user_id,
+                    len(beneficiaries),
+                )
+            else:
+                logger.warning(
+                    "hydrate_session_profile: MCP get_user_beneficiaries returned non-success for user_id=%s: %s",
+                    user_id,
+                    ben_res,
+                )
+        except Exception as e:
+            logger.exception(
+                "hydrate_session_profile: MCP get_user_beneficiaries failed for user_id=%s error=%s",
+                user_id,
+                e,
+            )
+
+        # Build compact accounts + primary from accounts_full
+        try:
+            for acc in accounts_full:
+                acct_num = acc.get("account_number")
+                if not acct_num:
+                    continue
+                accounts_compact.append(
+                    {
+                        "account_number": acct_num,
+                        "account_type": acc.get("account_type"),
+                        "currency": acc.get("currency"),
+                    }
+                )
+            for acc in accounts_full:
+                if (acc.get("account_type") or "").strip().lower() == "savings":
+                    primary_account = acc.get("account_number")
+                    break
+            if not primary_account and accounts_full:
+                primary_account = accounts_full[0].get("account_number")
+
+            logger.info(
+                "hydrate_session_profile: cached %d accounts for user_id=%s primary_account=%s via MCP",
+                len(accounts_compact),
+                user_id,
+                primary_account,
+            )
+        except Exception as e:
+            logger.exception(
+                "hydrate_session_profile: error while building account summary from MCP data for user_id=%s: %s",
+                user_id,
+                e,
+            )
+    else:
+        # Fallback to direct HTTP if MCP client is not available
+        base = VOX_BANK_BASE_URL.rstrip("/") if VOX_BANK_BASE_URL else None
+        if not base:
+            logger.error(
+                "hydrate_session_profile: neither MCP client nor VOX_BANK_BASE_URL configured; cannot hydrate profile"
+            )
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    profile_url = f"{base}/api/users/{user_id}"
+                    accounts_url = f"{base}/api/users/{user_id}/accounts"
+                    beneficiaries_url = f"{base}/api/users/{user_id}/beneficiaries"
+
+                    logger.info("hydrate_session_profile: HTTP fetching profile from %s", profile_url)
+                    try:
+                        profile_resp = await client.get(profile_url)
+                        profile_resp.raise_for_status()
+                        profile_data = profile_resp.json() or {}
+                        logger.info(
+                            "hydrate_session_profile: HTTP profile fetch successful for user_id=%s username=%s",
+                            user_id,
+                            profile_data.get("username"),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "hydrate_session_profile: HTTP profile fetch failed for user_id=%s error=%s",
+                            user_id,
+                            e,
+                        )
+
+                    logger.info("hydrate_session_profile: HTTP fetching accounts from %s", accounts_url)
+                    try:
+                        accounts_resp = await client.get(accounts_url)
+                        accounts_resp.raise_for_status()
+                        accounts_full = accounts_resp.json() or []
+
+                        for acc in accounts_full:
+                            acct_num = acc.get("account_number")
+                            if not acct_num:
+                                continue
+                            accounts_compact.append(
+                                {
+                                    "account_number": acct_num,
+                                    "account_type": acc.get("account_type"),
+                                    "currency": acc.get("currency"),
+                                }
+                            )
+                        for acc in accounts_full:
+                            if (acc.get("account_type") or "").strip().lower() == "savings":
+                                primary_account = acc.get("account_number")
+                                break
+                        if not primary_account and accounts_full:
+                            primary_account = accounts_full[0].get("account_number")
+
+                        logger.info(
+                            "hydrate_session_profile: HTTP cached %d accounts for user_id=%s primary_account=%s",
+                            len(accounts_compact),
+                            user_id,
+                            primary_account,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "hydrate_session_profile: HTTP accounts fetch failed for user_id=%s error=%s",
+                            user_id,
+                            e,
+                        )
+                    # Beneficiaries via HTTP (optional)
+                    logger.info("hydrate_session_profile: HTTP fetching beneficiaries from %s", beneficiaries_url)
+                    try:
+                        ben_resp = await client.get(beneficiaries_url)
+                        ben_resp.raise_for_status()
+                        beneficiaries = ben_resp.json() or []
+                        logger.info(
+                            "hydrate_session_profile: HTTP cached %d beneficiaries for user_id=%s",
+                            len(beneficiaries),
+                            user_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "hydrate_session_profile: HTTP beneficiaries fetch failed for user_id=%s error=%s",
+                            user_id,
+                            e,
+                        )
             except Exception as e:
-                logger.warning("hydrate_session_profile: accounts fetch failed for user_id=%s error=%s", user_id, e)
-    except Exception as e:
-        logger.exception("hydrate_session_profile: unexpected error while fetching profile/accounts: %s", e)
+                logger.exception(
+                    "hydrate_session_profile: unexpected HTTP error while fetching profile/accounts: %s", e
+                )
 
     # Update session profile fields
     sess = session_manager.ensure_session(session_id, user_id=user_id)
     # Prefer username from profile if available
     if profile_data.get("username"):
         sess["username"] = profile_data["username"]
+    # Store a safe copy of the user profile (without large/secret fields)
+    safe_profile = dict(profile_data) if profile_data else {}
+    safe_profile.pop("audio_embedding", None)
+    safe_profile.pop("passphrase", None)
+    sess["user_profile"] = safe_profile
     sess["accounts"] = accounts_compact
+    sess["beneficiaries"] = beneficiaries
     sess["primary_account"] = primary_account
     sess["is_authenticated"] = True
 
@@ -251,7 +392,7 @@ async def startup_event():
     Startup wiring:
      - Initialize Gemini LLM client
      - Initialize MCP client (discovery)
-     - Instantiate the LLMAgent with the clients
+     - Instantiate the VoxBankAgent + ConversationOrchestrator
      - Attempt to list available MCP tools and log them
     """
     # Load GEMINI settings
@@ -287,13 +428,15 @@ async def startup_event():
     except Exception as e:
         logger.exception("MCP client initialize failed: %s", e)
 
-    # Instantiate LLMAgent with dynamic tool_spec (falls back internally if empty)
-    app.state.agent = LLMAgent(
+    # Instantiate VoxBankAgent with dynamic tool_spec (falls back internally if empty)
+    app.state.agent = VoxBankAgent(
         model_name=gemini_model,
         llm_client=app.state.gemini_client,
         mcp_client=app.state.mcp_client,
         tool_spec=tool_spec or None,
     )
+    # Attach a ConversationOrchestrator for ReAct loop and MCP tool execution
+    app.state.orchestrator = ConversationOrchestrator(app.state.agent, app.state.mcp_client)
 
     # Log discovered tools for observability
     if tool_spec:
@@ -301,7 +444,7 @@ async def startup_event():
         for name, meta in tool_spec.items():
             logger.info(" - %s: %s", name, meta.get("description", ""))
     else:
-        logger.warning("Startup: no tool metadata loaded from MCP; LLMAgent will use fallback tool spec")
+        logger.warning("Startup: no tool metadata loaded from MCP; VoxBankAgent will use fallback tool spec")
 
     logger.info(
         "Orchestrator started. Gemini model=%s MCP base=%s",
@@ -380,7 +523,7 @@ async def logout(req: LogoutRequest):
         sess["pending_clarification"] = None
 
     # Clear agent auth state
-    agent: LLMAgent = app.state.agent
+    agent: VoxBankAgent = app.state.agent
     if session_id in agent.auth_state:
         try:
             del agent.auth_state[session_id]
@@ -441,14 +584,20 @@ async def register_user(request: RegisterRequest):
 
         # Bind session -> user if a session_id was provided
         if request.session_id:
-            sess = session_manager.ensure_session(request.session_id, user_id=str(user.get("user_id")))
+            user_id = str(user.get("user_id"))
+            sess = session_manager.ensure_session(request.session_id, user_id=user_id)
             sess["username"] = (user.get("username") or username_norm)
-            # Keep LLMAgent auth_state in sync so tools can be used without conversational login
+            # Hydrate session profile (user_profile, accounts, primary_account, is_authenticated)
             try:
-                agent: LLMAgent = app.state.agent
+                await hydrate_session_profile_from_mock_bank(request.session_id, user_id)
+            except Exception as e:
+                logger.exception("Register: failed to hydrate session profile after registration: %s", e)
+            # Keep agent auth_state in sync so tools can be used without conversational login
+            try:
+                agent: VoxBankAgent = app.state.agent
                 state = agent._get_auth_state(request.session_id)
                 state["authenticated"] = True
-                state["user_id"] = str(user.get("user_id"))
+                state["user_id"] = user_id
                 state["flow_stage"] = None
                 state["temp"] = {}
             except Exception as e:
@@ -468,7 +617,7 @@ async def login_user(request: LoginRequest) -> Dict[str, Any]:
     Login endpoint for the frontend.
 
     This validates credentials against mock-bank /api/login and, on success,
-    records {user_id, username} in the orchestrator session and LLMAgent auth_state.
+    records {user_id, username} in the orchestrator session and agent auth_state.
     """
     logger.info("API Request: POST /api/auth/login | username=%s session_id=%s", request.username, request.session_id)
 
@@ -504,9 +653,9 @@ async def login_user(request: LoginRequest) -> Dict[str, Any]:
         # hydrate profile (includes setting is_authenticated)
         await hydrate_session_profile_from_mock_bank(request.session_id, user_id)
 
-        # Sync LLMAgent auth state
+        # Sync agent auth state
         try:
-            agent: LLMAgent = app.state.agent
+            agent: VoxBankAgent = app.state.agent
             state = agent._get_auth_state(request.session_id)
             state["authenticated"] = True
             state["user_id"] = user_id
@@ -547,7 +696,7 @@ async def websocket_chat(ws: WebSocket):
     WebSocket endpoint used by the frontend voice/chat UI.
 
     It currently treats incoming text messages as complete user transcripts and
-    routes them through LLMAgent.orchestrate(), returning a single "reply"
+    routes them through agent.orchestrate(), returning a single "reply"
     message for each transcript.
     """
     await ws.accept()
@@ -614,7 +763,7 @@ async def websocket_chat(ws: WebSocket):
                 session["history"].append({"role": "user", "text": transcript})
 
                 try:
-                    agent: LLMAgent = app.state.agent
+                    agent: VoxBankAgent = app.state.agent
                     logger.info("WS: calling agent.orchestrate() for session %s", session_id)
                     profile = get_session_profile(session_id)
                     out = await agent.orchestrate(
@@ -685,7 +834,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
     logger.debug("Session state: %s", session)
 
     try:
-        agent: LLMAgent = app.state.agent
+        agent: VoxBankAgent = app.state.agent
         logger.info("Calling agent.orchestrate()")
 
         # Orchestrate (agent should return structure similar to voice flow)
@@ -776,7 +925,7 @@ async def parse_intent(req: TextRequest):
         logger.warning("Empty transcript in parse_intent")
         raise HTTPException(status_code=400, detail="transcript is required")
 
-    agent: LLMAgent = app.state.agent
+    agent: VoxBankAgent = app.state.agent
 
     try:
         # If agent exposes a direct intent function, prefer it
@@ -896,7 +1045,7 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
     logger.debug("Session state: %s", session)
 
     try:
-        agent: LLMAgent = app.state.agent
+        agent: VoxBankAgent = app.state.agent
         logger.info("Calling agent.orchestrate() for voice")
         profile = get_session_profile(session_id)
         # Orchestrate: this will return needs_confirmation if LLM asks for it
@@ -1015,7 +1164,7 @@ async def confirm_action(request: ConfirmRequest):
 
     # User confirmed: re-run orchestration with confirmation flag
     try:
-        agent: LLMAgent = app.state.agent
+        agent: VoxBankAgent = app.state.agent
         transcript = pending.get("transcript")
         # orchestrate with user_confirmation=True to perform the action
         out = await agent.orchestrate(transcript, session_id, user_confirmation=True)
