@@ -1,12 +1,16 @@
 """
 Standalone FastMCP HTTP Server
 --------------------------------
-This runs the MCP tool server over HTTP ONLY (not stdio).
+HTTP-only MCP tool server for VoxBank.
 
 Tools exposed:
  - balance
  - transactions
  - transfer
+ - register_user
+ - login_user
+ - set_user_audio_embedding
+ - get_user_profile
  - list_tools
 
 MCP endpoints created by FastMCP:
@@ -15,23 +19,25 @@ MCP endpoints created by FastMCP:
  - POST /mcp/call   (JSON-RPC batch/traces)
 """
 
-import os
 import logging
+import os
+
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
+from logging_config import get_logger, setup_logging
 
 load_dotenv()
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 VOX_BANK_BASE = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "9100"))
 REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "10"))
 
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("mcp_server")
+# Configure structured logging (file + console)
+setup_logging()
+logger = get_logger("mcp_server")
 
 # Shared HTTP client for mock-bank
 _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -104,73 +110,166 @@ TOOL_METADATA = {
     },
 }
 
+
+def _mock_bank_url(path: str) -> str:
+    base = VOX_BANK_BASE.rstrip("/")
+    return f"{base}{path}"
+
+
+async def _get_json(url: str, *, params: dict | None = None) -> dict:
+    """
+    Helper to GET JSON from mock-bank with consistent error handling.
+    """
+    try:
+        logger.info("HTTP GET %s params=%s", url, params)
+        r = await _http.get(url, params=params)
+        r.raise_for_status()
+        return {"ok": True, "data": r.json()}
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP GET failed url=%s status=%s detail=%s",
+            url,
+            e.response.status_code,
+            e,
+        )
+        detail = (
+            e.response.json().get("detail")
+            if e.response.headers.get("content-type", "").startswith("application/json")
+            else str(e)
+        )
+        return {
+            "ok": False,
+            "status": e.response.status_code,
+            "message": detail,
+        }
+    except Exception as e:  # pragma: no cover - network/lower level errors
+        logger.error("HTTP GET unexpected error url=%s error=%s", url, e)
+        return {"ok": False, "status": None, "message": str(e)}
+
+
+async def _post_json(url: str, payload: dict) -> dict:
+    """
+    Helper to POST JSON to mock-bank with consistent error handling.
+    """
+    try:
+        logger.info("HTTP POST %s payload_keys=%s", url, list(payload.keys()))
+        r = await _http.post(url, json=payload)
+        r.raise_for_status()
+        return {"ok": True, "data": r.json()}
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP POST failed url=%s status=%s detail=%s",
+            url,
+            e.response.status_code,
+            e,
+        )
+        detail = (
+            e.response.json().get("detail")
+            if e.response.headers.get("content-type", "").startswith("application/json")
+            else str(e)
+        )
+        return {
+            "ok": False,
+            "status": e.response.status_code,
+            "message": detail,
+        }
+    except Exception as e:  # pragma: no cover
+        logger.error("HTTP POST unexpected error url=%s error=%s", url, e)
+        return {"ok": False, "status": None, "message": str(e)}
+
+
+async def _put_json(url: str, payload: dict) -> dict:
+    """
+    Helper to PUT JSON to mock-bank with consistent error handling.
+    """
+    try:
+        logger.info("HTTP PUT %s payload_keys=%s", url, list(payload.keys()))
+        r = await _http.put(url, json=payload)
+        r.raise_for_status()
+        return {"ok": True, "data": r.json()}
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "HTTP PUT failed url=%s status=%s detail=%s",
+            url,
+            e.response.status_code,
+            e,
+        )
+        detail = (
+            e.response.json().get("detail")
+            if e.response.headers.get("content-type", "").startswith("application/json")
+            else str(e)
+        )
+        return {
+            "ok": False,
+            "status": e.response.status_code,
+            "message": detail,
+        }
+    except Exception as e:  # pragma: no cover
+        logger.error("HTTP PUT unexpected error url=%s error=%s", url, e)
+        return {"ok": False, "status": None, "message": str(e)}
+
+
 # -----------------------------
 # Tools
 # -----------------------------
 
+
 @mcp.tool(name="balance", description="Get account balance")
 async def balance(account_number: str) -> dict:
-    url = f"{VOX_BANK_BASE}/api/accounts/{account_number}"
-    try:
-        r = await _http.get(url)
-        r.raise_for_status()
-        data = r.json()
-        return {
-            "account_number": account_number,
-            "balance": float(data.get("balance", 0)),
-            "available_balance": data.get("available_balance"),
-            "currency": data.get("currency"),
-            "status": data.get("status")
-        }
-    except Exception as e:
-        logger.error("balance_tool error: %s", e)
-        return {"error": str(e)}
+    url = _mock_bank_url(f"/api/accounts/{account_number}")
+    result = await _get_json(url)
+    if not result["ok"]:
+        return {"error": result["message"], "status": result.get("status")}
+
+    data = result["data"]
+    return {
+        "account_number": account_number,
+        "balance": float(data.get("balance", 0)),
+        "available_balance": data.get("available_balance"),
+        "currency": data.get("currency"),
+        "status": data.get("status"),
+    }
 
 
-@mcp.tool(name="transactions", description="Fetch recent transactions")
+@mcp.tool(name="transactions", description="Get recent transactions")
 async def transactions(account_number: str, limit: int = 10) -> dict:
-    url = f"{VOX_BANK_BASE}/api/accounts/{account_number}/transactions?limit={limit}"
-    try:
-        r = await _http.get(url)
-        r.raise_for_status()
-        return {
-            "account_number": account_number,
-            "transactions": r.json()
-        }
-    except Exception as e:
-        logger.error("transactions_tool error: %s", e)
-        return {"error": str(e)}
+    url = _mock_bank_url(f"/api/accounts/{account_number}/transactions")
+    result = await _get_json(url, params={"limit": limit})
+    if not result["ok"]:
+        return {"error": result["message"], "status": result.get("status")}
+
+    return {
+        "account_number": account_number,
+        "transactions": result["data"],
+    }
 
 
-@mcp.tool(name="transfer", description="Execute money transfer (high risk)")
+@mcp.tool(name="transfer", description="Transfer funds between accounts")
 async def transfer(
     from_account_number: str,
     to_account_number: str,
     amount: float,
     currency: str = "USD",
-    initiated_by_user_id: str = None,
-    reference: str = None
+    initiated_by_user_id: str | None = None,
+    reference: str | None = None,
 ) -> dict:
+    url = _mock_bank_url("/api/transfer")
     payload = {
         "from_account_number": from_account_number,
         "to_account_number": to_account_number,
         "amount": amount,
         "currency": currency,
         "initiated_by_user_id": initiated_by_user_id,
-        "reference": reference
+        "reference": reference,
     }
+    result = await _post_json(url, payload)
+    if not result["ok"]:
+        return {"error": result["message"], "status": result.get("status")}
 
-    url = f"{VOX_BANK_BASE}/api/transfer"
-    try:
-        r = await _http.post(url, json=payload)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error("transfer_tool error: %s", e)
-        return {"error": str(e)}
+    return result["data"]
 
 
-@mcp.tool(name="register_user", description="Register a new VoxBank user with username and passphrase")
+@mcp.tool(name="register_user", description="Register a new VoxBank user")
 async def register_user(
     username: str,
     passphrase: str,
@@ -182,7 +281,7 @@ async def register_user(
     """
     Wraps POST /api/users on the mock-bank service.
     """
-    url = f"{VOX_BANK_BASE}/api/users"
+    url = _mock_bank_url("/api/users")
     payload = {
         "username": username,
         "passphrase": passphrase,
@@ -191,18 +290,16 @@ async def register_user(
         "phone_number": phone_number,
         "audio_embedding": audio_embedding,
     }
-    try:
-        r = await _http.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return {"status": "success", "user": data}
-    except httpx.HTTPStatusError as e:
-        logger.error("register_user error: %s", e)
-        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
-        return {"status": "error", "message": detail, "http_status": e.response.status_code}
-    except Exception as e:
-        logger.error("register_user unexpected error: %s", e)
-        return {"status": "error", "message": str(e)}
+    result = await _post_json(url, payload)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    data = result["data"]
+    return {"status": "success", "user": data}
 
 
 @mcp.tool(name="login_user", description="Validate username + passphrase and return user_id")
@@ -210,26 +307,24 @@ async def login_user(username: str, passphrase: str) -> dict:
     """
     Wraps POST /api/login on the mock-bank service.
     """
-    url = f"{VOX_BANK_BASE}/api/login"
+    url = _mock_bank_url("/api/login")
     payload = {"username": username, "passphrase": passphrase}
-    try:
-        r = await _http.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    result = await _post_json(url, payload)
+    if not result["ok"]:
         return {
-            "status": data.get("status", "ok"),
-            "user_id": data.get("user_id"),
-            "username": data.get("username"),
-            "has_audio_embedding": data.get("has_audio_embedding", False),
-            "message": data.get("message"),
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
         }
-    except httpx.HTTPStatusError as e:
-        logger.error("login_user error: %s", e)
-        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
-        return {"status": "error", "message": detail, "http_status": e.response.status_code}
-    except Exception as e:
-        logger.error("login_user unexpected error: %s", e)
-        return {"status": "error", "message": str(e)}
+
+    data = result["data"]
+    return {
+        "status": data.get("status", "ok"),
+        "user_id": data.get("user_id"),
+        "username": data.get("username"),
+        "has_audio_embedding": data.get("has_audio_embedding", False),
+        "message": data.get("message"),
+    }
 
 
 @mcp.tool(name="set_user_audio_embedding", description="Set or replace the audio embedding for a user")
@@ -237,20 +332,18 @@ async def set_user_audio_embedding(user_id: str, audio_embedding: list[float]) -
     """
     Wraps PUT /api/users/{user_id}/audio-embedding.
     """
-    url = f"{VOX_BANK_BASE}/api/users/{user_id}/audio-embedding"
+    url = _mock_bank_url(f"/api/users/{user_id}/audio-embedding")
     payload = {"audio_embedding": audio_embedding}
-    try:
-        r = await _http.put(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return {"status": "success", "user": data}
-    except httpx.HTTPStatusError as e:
-        logger.error("set_user_audio_embedding error: %s", e)
-        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
-        return {"status": "error", "message": detail, "http_status": e.response.status_code}
-    except Exception as e:
-        logger.error("set_user_audio_embedding unexpected error: %s", e)
-        return {"status": "error", "message": str(e)}
+    result = await _put_json(url, payload)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    data = result["data"]
+    return {"status": "success", "user": data}
 
 
 @mcp.tool(name="get_user_profile", description="Fetch a user's profile by user_id")
@@ -258,19 +351,16 @@ async def get_user_profile(user_id: str) -> dict:
     """
     Wraps GET /api/users/{user_id} and returns profile info.
     """
-    url = f"{VOX_BANK_BASE}/api/users/{user_id}"
-    try:
-        r = await _http.get(url)
-        r.raise_for_status()
-        data = r.json()
-        return {"status": "success", "user": data}
-    except httpx.HTTPStatusError as e:
-        logger.error("get_user_profile error: %s", e)
-        detail = e.response.json().get("detail") if e.response.headers.get("content-type", "").startswith("application/json") else str(e)
-        return {"status": "error", "message": detail, "http_status": e.response.status_code}
-    except Exception as e:
-        logger.error("get_user_profile unexpected error: %s", e)
-        return {"status": "error", "message": str(e)}
+    url = _mock_bank_url(f"/api/users/{user_id}")
+    result = await _get_json(url)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+
+    return {"status": "success", "user": result["data"]}
 
 
 @mcp.tool(name="list_tools", description="List available MCP tools")
@@ -280,8 +370,8 @@ def list_tools() -> dict:
         # Prefer TOOL_METADATA as the canonical source. This ensures the
         # orchestrator can build prompts and validation rules dynamically.
         return {"tools": TOOL_METADATA}
-    except Exception as e:
-        logger.error(f"Error in list_tools: {e}")
+    except Exception as e:  # pragma: no cover
+        logger.error("Error in list_tools: %s", e)
         return {"tools": {}}
 
 
@@ -289,14 +379,16 @@ def list_tools() -> dict:
 # Start MCP HTTP server
 # -----------------------------
 def main():
-    logger.info(f"Starting MCP HTTP server on http://{MCP_HOST}:{MCP_PORT}")
-    
+    logger.info("Starting MCP HTTP server on http://%s:%s", MCP_HOST, MCP_PORT)
+
     # The magic line:
     mcp.run(
         host=MCP_HOST,
         port=MCP_PORT,
-        transport="streamable-http"
+        transport="streamable-http",
     )
+
 
 if __name__ == "__main__":
     main()
+
