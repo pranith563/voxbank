@@ -1,5 +1,6 @@
 import base64
 import io
+from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
 
@@ -112,12 +113,12 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
 
     logger.info("Creating user username=%s", username_norm)
 
-    # Check if username already exists
+    # Check if username already exists (case-insensitive)
     stmt = select(User).where(func.lower(User.username) == username_norm)
     res = await db.execute(stmt)
     exists = res.scalars().first()
     if exists:
-        logger.warning("Username already exists username=%s", payload.username)
+        logger.warning("Username already exists username=%s", username_norm)
         raise HTTPException(status_code=409, detail="Username already exists")
 
     # Basic inferred email if not provided
@@ -142,8 +143,25 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         except Exception as e:
             logger.exception("create_user: failed to decode audio_data: %s", e)
 
+    # Generate a deterministic default savings account number for this prototype.
+    # We use the current count of accounts to form ACC000001, ACC000002, ...
+    acct_number = None
+    try:
+        count_stmt = select(func.count()).select_from(Account)
+        count_res = await db.execute(count_stmt)
+        current_count = count_res.scalar_one() or 0
+        acct_number = f"ACC{current_count + 1:06d}"
+    except Exception as e:
+        logger.exception("create_user: failed to compute next account number; falling back to random: %s", e)
+        # very low collision risk; acceptable for prototype
+        acct_number = f"ACC{uuid4().hex[:8].upper()}"
+
+    # Create user first with an explicit UUID so we can safely link the default
+    # account without relying on server-side key generation.
+    new_user_id = uuid4()
+
     u = User(
-        user_id=uuid4(),
+        user_id=new_user_id,
         username=username_norm,
         email=email,
         password_hash=password_hash,
@@ -154,10 +172,35 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         passphrase=passphrase_norm,
         audio_embedding=audio_embedding,
     )
+
+    default_balance = Decimal("5000.00")
+    # Add user and flush so we have a concrete user_id for the FK
     db.add(u)
+    await db.flush()
+
+    acct = Account(
+        account_id=uuid4(),
+        account_number=acct_number,
+        user_id=new_user_id,
+        account_type="savings",
+        currency="USD",
+        balance=default_balance,
+        available_balance=default_balance,
+        status="active",
+    )
+    db.add(acct)
+
+    # Commit both user and default account in a single transaction
     await db.commit()
     await db.refresh(u)
-    logger.info("Created user user_id=%s username=%s", u.user_id, u.username)
+    await db.refresh(acct)
+    logger.info(
+        "Created user user_id=%s username=%s with default savings account %s balance=%s",
+        u.user_id,
+        u.username,
+        acct.account_number,
+        acct.balance,
+    )
     return serialize_user(u)
 
 

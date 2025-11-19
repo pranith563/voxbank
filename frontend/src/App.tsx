@@ -26,20 +26,18 @@ function App() {
   const [language, setLanguage] = useState("en-US");
   const [voiceType, setVoiceType] = useState("default");
 
-  // On mount or when sessionId changes, ask orchestrator which user (if any)
-  // is associated with this session. This keeps frontend state in sync with
-  // server-side session/auth state.
   useEffect(() => {
     if (!sessionId) return;
-    const controller = new AbortController();
-    (async () => {
+    let cancelled = false;
+
+    async function fetchSessionProfile() {
       try {
         const resp = await fetch(`/api/session/me?session_id=${encodeURIComponent(sessionId)}`, {
           method: "GET",
-          signal: controller.signal,
         });
         if (!resp.ok) return;
         const json = await resp.json();
+        if (cancelled) return;
         if (json?.authenticated && json.user?.username) {
           setCurrentUser(json.user.username as string);
         } else {
@@ -48,8 +46,16 @@ function App() {
       } catch {
         // best-effort; ignore network errors
       }
-    })();
-    return () => controller.abort();
+    }
+
+    // initial fetch
+    fetchSessionProfile();
+    // poll periodically so conversational login updates the header
+    const id = window.setInterval(fetchSessionProfile, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, [sessionId]);
 
   function handleLogout() {
