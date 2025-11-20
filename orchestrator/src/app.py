@@ -170,6 +170,8 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
     return profile
 
 
+
+
 async def hydrate_session_profile_from_mock_bank(session_id: str, user_id: str) -> None:
     """
     Fetch user profile + accounts (and beneficiaries) from mock-bank and cache

@@ -19,6 +19,7 @@ from .helpers import (
     render_history_for_prompt,
     format_observation_for_history,
 )
+from .normalizer import normalize_input
 
 
 logger = logging.getLogger("llm_agent")
@@ -110,6 +111,50 @@ class ConversationOrchestrator:
         # observation is the last tool output passed back into decision
         observation: Any = None
 
+        # Normalize raw transcript once per turn via the small normalizer LLM
+        history_for_norm = self.agent.get_history(session_id)
+        last_assistant_msg = None
+        if history_for_norm:
+            for msg in reversed(history_for_norm):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("text")
+                    break
+
+        language = "en"
+        if session_profile:
+            language = (
+                session_profile.get("user_profile", {}).get("preferred_language")
+                or session_profile.get("language")
+                or "en"
+            )
+
+        try:
+            normalized = await normalize_input(
+                llm_client=self.agent.llm_client,
+                raw_text=transcript,
+                last_assistant_msg=last_assistant_msg,
+                language=language,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("ORCHESTRATE: normalize_input failed; using raw transcript: %s", e)
+            normalized = {
+                "cleaned_text": transcript,
+                "numbers": [],
+                "primary_number": None,
+                "currency_hint": None,
+                "message_type": "free_text",
+            }
+
+        effective_transcript = normalized.get("cleaned_text") or transcript
+        logger.info(
+            "ORCHESTRATE: normalized transcript='%s' (raw='%s') message_type=%s numbers=%s primary=%s",
+            effective_transcript,
+            transcript,
+            normalized.get("message_type"),
+            normalized.get("numbers"),
+            normalized.get("primary_number"),
+        )
+
         while iterations < eff_max_iterations:
             iterations += 1
             logger.info("ReAct loop iteration %d/%d", iterations, eff_max_iterations)
@@ -122,15 +167,16 @@ class ConversationOrchestrator:
             auth_flag = self.agent.is_authenticated(session_id)
             
             parsed = await self.agent.decision(
-                transcript,
+                effective_transcript,
                 context_str,
                 session_profile=session_profile,
                 observation=observation,
                 auth_state=auth_flag,
                 user_context_block=user_context_block,
                 tools_block=tools_block,
+                normalized_input=normalized,
             )
-            self.agent._append_history(session_id, {"role": "user", "text": transcript})
+            self.agent._append_history(session_id, {"role": "user", "text": effective_transcript})
             logger.debug("Added user message to history")
 
             action = parsed.get("action")
@@ -217,7 +263,6 @@ class ConversationOrchestrator:
             # call_tool -> gate by auth, resolve accounts, execute tool, loop again
             if action == "call_tool" and requires_tool and tool_name:
                 logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
-
                 # Gate all non-auth tools behind login/registration.
                 auth_tools = {
                     "register_user",
@@ -282,6 +327,26 @@ class ConversationOrchestrator:
                             )
                             logger.info("=" * 80)
                             return {"status": "clarify", "message": clarify, "parsed": parsed}
+
+                        user_accounts = {
+                            acc.get("account_number")
+                            for acc in (session_profile.get("accounts") or [])
+                            if acc.get("account_number")
+                        }
+                        if user_accounts and from_number not in user_accounts:
+                            msg = (
+                                "I can’t move money from an account that doesn’t belong to you. "
+                                "Please choose one of your own accounts as the source."
+                            )
+                            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+                            logger.info(
+                                "SECURITY: blocked transfer from non-owned account %s for session %s",
+                                from_number,
+                                session_id,
+                            )
+                            logger.info("=" * 80)
+                            return {"status": "ok", "response": msg}
+
                         tool_input["from_account_number"] = from_number
                         parsed["tool_input"]["from_account_number"] = from_number
 

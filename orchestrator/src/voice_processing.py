@@ -23,7 +23,10 @@ import wave
 
 logger = logging.getLogger("voxbank.voice_processing")
 
-# Global TTS backend selector: "openai" or "gemini"
+# Hint for HF hub to behave nicely on Windows (also used in voice_auth)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+
+# Global TTS backend selector: "openai", "gemini", or "local"
 TTS_PROVIDER = (os.getenv("TTS_PROVIDER") or "openai").lower()
 
 # OpenAI TTS configuration (for gpt-4o-mini-tts)
@@ -47,10 +50,17 @@ SAMPLE_RATE = 24000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2  # 16-bit = 2 bytes
 
-# Lazy-initialized SDK clients (shared across calls)
+# Local TTS (SpeechBrain) configuration
+LOCAL_TTS_MODEL = os.getenv("LOCAL_TTS_MODEL", "speechbrain/tts-tacotron2-ljspeech")
+LOCAL_VOCODER_MODEL = os.getenv("LOCAL_VOCODER_MODEL", "speechbrain/tts-hifigan-ljspeech")
+LOCAL_SAMPLE_RATE = 22050  # typical for LJSpeech models
+
+# Lazy-initialized SDK clients / models (shared across calls)
 _openai_client = None
 _gemini_client = None
 _genai_types = None
+_local_tts_model = None
+_local_vocoder = None
 
 
 async def transcribe_audio_to_text(audio_bytes: bytes, *, lang: str = "en") -> str:
@@ -100,7 +110,16 @@ async def synthesize_text_to_audio(text: str, *, lang: str = "en") -> Optional[b
     audio = await _synthesize_with_gemini(text, lang=lang)
     if audio is None:
       logger.warning(
-        "TTS: Gemini backend failed or not configured; falling back to OpenAI if available"
+        "TTS: Gemini backend failed or not configured; will fall back to other providers"
+      )
+
+  # Try local SpeechBrain TTS if explicitly requested or Gemini failed
+  if audio is None and requested_provider in {"local", "speechbrain"}:
+    provider_used = "local"
+    audio = await _synthesize_with_local(text, lang=lang)
+    if audio is None:
+      logger.warning(
+        "TTS: Local (SpeechBrain) backend failed or not configured; will fall back to OpenAI if available"
       )
 
   # Fallback or default: OpenAI
@@ -294,6 +313,84 @@ async def _synthesize_with_gemini(text: str, *, lang: str = "en") -> Optional[by
     return None
   except Exception as e:  # pragma: no cover - external dependency
     logger.exception("TTS(Gemini): synthesis failed: %s", e)
+    return None
+
+
+async def _synthesize_with_local(text: str, *, lang: str = "en") -> Optional[bytes]:
+  """
+  Local TTS helper using SpeechBrain Tacotron2 + HiFi-GAN.
+
+  This runs entirely on the local machine and can reduce latency by
+  avoiding network calls once models are downloaded.
+  """
+  try:
+    # Import heavy dependencies lazily so they don't affect startup
+    from speechbrain.inference.TTS import Tacotron2  # type: ignore
+    from speechbrain.inference.vocoders import HIFIGAN  # type: ignore
+    import torch  # type: ignore
+    import numpy as np  # type: ignore
+  except Exception as e:  # pragma: no cover - optional dependency
+    logger.warning("TTS(Local): SpeechBrain / torch not available; cannot synthesize audio (%s)", e)
+    return None
+
+  global _local_tts_model, _local_vocoder
+  if _local_tts_model is None or _local_vocoder is None:
+    try:
+      logger.info(
+        "TTS(Local): loading SpeechBrain models tts=%s vocoder=%s",
+        LOCAL_TTS_MODEL,
+        LOCAL_VOCODER_MODEL,
+      )
+      _local_tts_model = Tacotron2.from_hparams(
+        source=LOCAL_TTS_MODEL,
+        savedir="pretrained_models/tts-tacotron2-ljspeech",
+      )
+      _local_vocoder = HIFIGAN.from_hparams(
+        source=LOCAL_VOCODER_MODEL,
+        savedir="pretrained_models/tts-hifigan-ljspeech",
+      )
+      logger.info("TTS(Local): SpeechBrain models loaded")
+    except Exception as e:  # pragma: no cover - model download/initialization issues
+      logger.exception("TTS(Local): failed to load SpeechBrain models: %s", e)
+      return None
+
+  def _call_local_tts() -> Optional[bytes]:
+    try:
+      tts_model = _local_tts_model
+      vocoder = _local_vocoder
+      if tts_model is None or vocoder is None:
+        return None
+
+      logger.info("TTS(Local): synthesizing text_len=%d", len(text))
+      with torch.no_grad():
+        mel_output, mel_length, alignment = tts_model.encode_text(text)
+        waveforms = vocoder.decode_batch(mel_output)  # (batch, 1, time)
+
+      # Convert to mono waveform numpy array
+      waveform = waveforms[0].squeeze().cpu().numpy()
+      # Normalize to int16 PCM
+      waveform = waveform / max(np.max(np.abs(waveform)), 1e-8)
+      pcm_int16 = (waveform * 32767.0).astype("<i2")
+
+      bio = BytesIO()
+      with wave.open(bio, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(LOCAL_SAMPLE_RATE)
+        wf.writeframes(pcm_int16.tobytes())
+      return bio.getvalue()
+    except Exception as exc:  # pragma: no cover - local TTS runtime issues
+      logger.exception("TTS(Local): synthesis failed (sync): %s", exc)
+      return None
+
+  try:
+    audio_bytes = await asyncio.to_thread(_call_local_tts)
+    if audio_bytes:
+      logger.info("TTS(Local): produced %d bytes of audio", len(audio_bytes))
+      return audio_bytes
+    return None
+  except Exception as e:
+    logger.exception("TTS(Local): synthesis failed: %s", e)
     return None
 
 

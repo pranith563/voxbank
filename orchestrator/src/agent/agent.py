@@ -20,12 +20,12 @@ import logging
 import re
 import os
 import json
-import ast
 from decimal import Decimal
 
 import httpx
 from pydantic.types import T
 from gemini_llm_client import GeminiLLMClient
+from guards.json_clean import validate_ai_json
 
 from prompts.tool_spec import TOOL_SPEC as FALLBACK_TOOL_SPEC
 from prompts.decision_prelogin import PRELOGIN_PROMPT_TEMPLATE
@@ -398,6 +398,7 @@ class VoxBankAgent:
         max_tokens: int = 512,
         user_context_block: Optional[str] = None,
         tools_block: Optional[str] = None,
+        normalized_input: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """
         Ask the LLM to *decide* action: respond, call_tool, ask_user, or ask_confirmation.
@@ -425,7 +426,7 @@ class VoxBankAgent:
             if user_context_block is None:
                 user_context_block = build_user_context_block(session_profile)
             effective_tools_block = tools_block if tools_block is not None else getattr(self, "tools_block", "")
-            logger.info("user_context: %s\n",user_context_block)
+            logger.info("user_context: %s\n", user_context_block)
             prompt = (
                 self.postlogin_prompt_template
                 .replace("{history}", context)
@@ -434,7 +435,15 @@ class VoxBankAgent:
                 .strip()
             )
 
-        prompt = f'{prompt}\n\nUser request: "{transcript}"\n'
+        normalized_block = ""
+        if normalized_input is not None:
+            try:
+                normalized_json = json.dumps(normalized_input, default=str)
+            except Exception:
+                normalized_json = str(normalized_input)
+            normalized_block = f"\n\nnormalized_input (JSON):\n{normalized_json}"
+
+        prompt = f'{prompt}{normalized_block}\n\nUser request: "{transcript}"\n'
         if observation is not None:
             try:
                 obs_json = json.dumps(observation, default=str)
@@ -443,41 +452,32 @@ class VoxBankAgent:
             prompt += f"\nObservation (from tool): {obs_json}\n"
         prompt += "\nReturn JSON now."
         logger.info("Calling LLM with prompt (length: %d chars)", len(prompt))
-
+        logger.info("PROMPT \n %s \n", prompt)
         raw = await self.call_llm(prompt, max_tokens=max_tokens)
-        logger.info(raw)
-        logger.info("LLM raw response received (length: %d chars)", len(raw))
-
-        # Some models wrap JSON in Markdown-style ```json ... ``` fences.
-        # Strip those fences if present so json.loads can parse it.
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            # Drop the first line (e.g. ```json or ```).
-            newline_idx = cleaned.find("\n")
-            if newline_idx != -1:
-                cleaned = cleaned[newline_idx + 1 :]
-            else:
-                # No newline, just strip the fence prefix.
-                cleaned = cleaned.lstrip("`")
-        if cleaned.endswith("```"):
-            cleaned = cleaned[: cleaned.rfind("```")]
-        cleaned = cleaned.strip()
-
+        logger.info("LLM raw response received (length: %d chars)", len(raw) if raw else 0)
+        logger.info("LLM RESPOSNE: \n %s \n",raw);
+        # Use json_clean.validate_ai_json to robustly extract and parse JSON from LLM output
+        parsed = None
         try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError:
-            # Fallback: some models emit Python-style dicts with single quotes.
-            # Try ast.literal_eval to recover, then normalise to a plain dict.
+            validation = validate_ai_json(raw)
+            if getattr(validation, "json_valid", False):
+                parsed = validation.data
+            else:
+                logger.warning(
+                    "validate_ai_json reported invalid JSON (truncated=%s, errors=%s); "
+                    "falling back to basic json.loads",
+                    getattr(validation, "likely_truncated", False),
+                    getattr(validation, "errors", []),
+                )
+        except Exception:
+            logger.exception("validate_ai_json failed; falling back to basic json.loads")
+
+        if parsed is None:
             try:
-                logger.warning("Primary JSON parse failed; attempting literal_eval fallback")
-                obj = ast.literal_eval(cleaned)
-                if isinstance(obj, dict):
-                    parsed = obj
-                else:
-                    raise ValueError("literal_eval did not return a dict")
+                parsed = json.loads(raw)
             except Exception:
-                logger.exception("Failed to parse LLM decision JSON; raw=%s", raw)
-                raise
+                logger.exception("Fallback JSON parsing failed; returning minimal decision. Raw=%s", raw)
+                parsed = {"action": "respond", "intent": "unknown", "response": ""}
 
         # Normalisation and validation
         if not isinstance(parsed, dict):
@@ -553,7 +553,6 @@ class VoxBankAgent:
         logger.info("LLM DECISION - Complete")
         logger.info("=" * 80)
         return parsed
-
     # ------------------------------------------------------------------
     # Orchestration delegator (keeps external API stable)
     # ------------------------------------------------------------------
