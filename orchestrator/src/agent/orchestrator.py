@@ -464,6 +464,30 @@ class ConversationOrchestrator:
             )
             return None, tool_result, False
 
+        # Security guard: transfer source account must belong to the logged-in user.
+        if tool_name == "transfer" and session_profile:
+            from_number = None
+            if isinstance(tool_input, dict):
+                from_number = tool_input.get("from_account_number")
+            user_accounts = {
+                acc.get("account_number")
+                for acc in (session_profile.get("accounts") or [])
+                if acc.get("account_number")
+            }
+            if from_number and user_accounts and from_number not in user_accounts:
+                msg = (
+                    "I can't move money from an account that doesn't belong to you. "
+                    "Please choose one of your own accounts as the source."
+                )
+                self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+                logger.info(
+                    "SECURITY: blocked transfer from non-owned account %s for session %s",
+                    from_number,
+                    session_id,
+                )
+                logger.info("=" * 80)
+                return {"status": "ok", "response": msg}, None, False
+
         if requires_confirmation and not user_confirmation:
             confirm_response = self._build_confirmation_response(
                 session_id=session_id,
