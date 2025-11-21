@@ -17,7 +17,9 @@ from otp_manager import OtpManager
 from .agent import VoxBankAgent
 from .helpers import (
     build_user_context_block,
+    format_observation_for_history,
     render_history_for_prompt,
+    resolve_account_from_profile,
 )
 from .normalizer import normalize_input
 from .otp_workflow import OtpWorkflow
@@ -242,213 +244,46 @@ class ConversationOrchestrator:
                 logger.info("=" * 80)
                 return {"status": status, "message": assistant_response}
 
-            # respond -> final reply
             if action == "respond" and assistant_response:
-                logger.info(
-                    "Using LLM-provided response (action=respond) - checking if polishing needed",
+                respond_result = await self._handle_respond(
+                    transcript=transcript,
+                    session_id=session_id,
+                    intent=intent,
+                    assistant_response=assistant_response,
+                    reply_style=reply_style,
+                    logout_requested=logout_requested,
+                    tool_result=tool_result,
+                    parsed=parsed,
                 )
-                should_polish = False  # previously computed but effectively disabled
-                if should_polish:
-                    logger.info("Polishing assistant response via generate_response()")
-                    try:
-                        polished = await self.agent.generate_response(
-                            intent or "unknown",
-                            parsed.get("tool_input", {}),
-                            tool_result or parsed.get("tool_output"),
-                            reply_style=reply_style,
-                        )
-                        final_reply = polished or assistant_response
-                    except Exception as e:
-                        logger.exception(
-                            "Polishing failed: %s. Falling back to raw assistant_response",
-                            e,
-                        )
-                        final_reply = assistant_response
-                else:
-                    final_reply = assistant_response
+                return respond_result
 
-                if not logout_requested:
-                    try:
-                        lower_tx = (transcript or "").lower()
-                        lower_resp = final_reply.lower()
-                        intent_norm = (intent or "").lower() if intent else ""
-                        logout_phrases = (
-                            "logout",
-                            "logged_out",
-                            "logged",
-                            "log out",
-                            "sign out",
-                            "signout",
-                            "log me out",
-                            "log out now",
-                        )
-                        logout_intents = {"logout", "signout", "reset_session"}
-                        if any(p in lower_tx for p in logout_phrases) or any(
-                            p in lower_resp for p in logout_phrases
-                        ) or intent_norm in logout_intents:
-                            logout_requested = True
-                                    
-                    except Exception as e:  # pragma: no cover - defensive logging
-                        logger.exception("Fallback logout_user tool call failed: %s", e)
-
-                self.agent._append_history(session_id, {"role": "assistant", "text": final_reply})
-                logger.info("ORCHESTRATE - Complete (respond)")
-                result = {"status": "ok", "response": final_reply, "logged_out":logout_requested}
-                return result
-            # call_tool -> gate by auth, resolve accounts, execute tool, loop again
             if action == "call_tool" and requires_tool and tool_name:
-                logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
-                    if parsed is not None:
-                        parsed["tool_input"] = {}
-                if tool_name == "logout_user":
-                    result = {"status": "ok", "response": assistant_response, "logged_out":True}
-                    return result
-                user_scoped_tools = {"cards_summary", "loans_summary", "reminders_summary"}
-                if (
-                    tool_name in user_scoped_tools
-                    and session_profile
-                    and session_profile.get("user_id")
-                    and not tool_input.get("user_id")
-                ):
-                    user_id_value = session_profile.get("user_id")
-                    tool_input["user_id"] = user_id_value
-                    if parsed is not None:
-                        parsed.setdefault("tool_input", {})["user_id"] = user_id_value
-                # Gate all non-auth tools behind login/registration.
-                auth_tools = {
-                    "register_user",
-                    "login_user",
-                    "set_user_audio_embedding",
-                    "get_user_profile",
-                    "list_tools",
-                    "logout_user",
-                }
-                if not parse_only and not self.agent.is_authenticated(session_id) and tool_name not in auth_tools:
-                    logger.info(
-                        "AUTH: session %s not authenticated; prompting for login/registration before tool %s",
-                        session_id,
-                        tool_name,
-                    )
-                    state = self.agent._get_auth_state(session_id)
-                    if not state.get("flow_stage"):
-                        state["flow_stage"] = "await_choice"
-                    msg = "You're not logged in yet. Would you like to login or register?"
-                    self.agent._append_history(session_id, {"role": "assistant", "text": msg})
-                    logger.info(
-                        "ORCHESTRATE - Completed (auth_required before tool exec) at iter %d",
-                        iterations,
-                    )
-                    logger.info("=" * 80)
-                    return {"status": "clarify", "message": msg, "parsed": parsed}
-
-                # Resolve abstract account labels based on session_profile
-                if session_profile:
-                    from agent.helpers import resolve_account_from_profile  # local import to avoid cycles
-
-                    if tool_name in ("balance", "transactions"):
-                        acct_label = tool_input.get("account_number")
-                        acct_number = resolve_account_from_profile(session_profile, acct_label)
-                        if not acct_number:
-                            clarify = (
-                                "I couldn't determine which account to use. "
-                                "Please specify which account (for example, your savings or current account)."
-                            )
-                            self.agent._append_history(session_id, {"role": "assistant", "text": clarify})
-                            logger.info(
-                                "ORCHESTRATE - Unable to resolve account label '%s' for tool %s; asking user to clarify",
-                                acct_label,
-                                tool_name,
-                            )
-                            logger.info("=" * 80)
-                            return {"status": "clarify", "message": clarify, "parsed": parsed}
-                        tool_input["account_number"] = acct_number
-                        parsed["tool_input"]["account_number"] = acct_number
-
-                    if tool_name == "transfer":
-                        from_label = tool_input.get("from_account_number")
-                        from_number = resolve_account_from_profile(session_profile, from_label)
-                        if not from_number:
-                            clarify = (
-                                "Which account would you like to send money from? "
-                                "You can say your savings account or current account."
-                            )
-                            self.agent._append_history(session_id, {"role": "assistant", "text": clarify})
-                            logger.info(
-                                "ORCHESTRATE - Unable to resolve from_account label '%s' for transfer; asking user to clarify",
-                                from_label,
-                            )
-                            logger.info("=" * 80)
-                            return {"status": "clarify", "message": clarify, "parsed": parsed}
-
-                        user_accounts = {
-                            acc.get("account_number")
-                            for acc in (session_profile.get("accounts") or [])
-                            if acc.get("account_number")
-                        }
-                        if user_accounts and from_number not in user_accounts:
-                            msg = (
-                                "I can't move money from an account that doesn't belong to you. "
-                                "Please choose one of your own accounts as the source."
-                            )
-                            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
-                            logger.info(
-                                "SECURITY: blocked transfer from non-owned account %s for session %s",
-                                from_number,
-                                session_id,
-                            )
-                            logger.info("=" * 80)
-                            return {"status": "ok", "response": msg}
-
-                        if (
-                            not parse_only
-                            and self.otp_workflow.should_trigger_transfer_otp(
-                                session_id=session_id,
-                                amount_value=tool_input.get("amount"),
-                                session_profile=session_profile,
-                            )
-                        ):
-                            otp_response = await self.otp_workflow.initiate_transfer_otp(
-                                session_id=session_id,
-                                session_profile=session_profile,
-                                tool_name=tool_name,
-                                tool_input=tool_input,
-                                intent=intent,
-                            )
-                            if otp_response:
-                                return otp_response
-
-                        tool_input["from_account_number"] = from_number
-                        parsed["tool_input"]["from_account_number"] = from_number
-
-                # Confirmation for high-risk actions
-                if requires_confirmation and not user_confirmation:
-                    confirm_msg = f"I will perform: {intent}. {assistant_response or 'Do you want to proceed?'}"
-                    self.agent._append_history(session_id, {"role": "assistant", "text": confirm_msg})
-                    logger.info(
-                        "ORCHESTRATE - Completed (needs_confirmation before tool exec) at iter %d",
-                        iterations,
-                    )
-                    logger.info("=" * 80)
-                    return {"status": "needs_confirmation", "message": confirm_msg}
-
-                # Execute tool via MCP
-                if not self.mcp_client:
-                    logger.error("MCP client not configured - cannot execute tool")
-                else:
-                    try:
-                        logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, tool_input)
-                        tool_result = await self.execute_tool(tool_name, tool_input)
-                        logger.info("Tool result: %s", tool_result)
-                    except Exception as e:
-                        logger.exception("Exception while executing tool %s: %s", tool_name, e)
-
-
-                if (
-                    tool_name == "logout_user"
-                ):
+                (
+                    early_response,
+                    new_tool_result,
+                    logout_flag,
+                ) = await self._handle_call_tool(
+                    action=action,
+                    intent=intent,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    requires_tool=requires_tool,
+                    requires_confirmation=requires_confirmation,
+                    user_confirmation=user_confirmation,
+                    assistant_response=assistant_response,
+                    transcript=transcript,
+                    session_id=session_id,
+                    session_profile=session_profile,
+                    parse_only=parse_only,
+                    reply_style=reply_style,
+                    iterations=iterations,
+                    parsed=parsed,
+                )
+                if logout_flag:
                     logout_requested = True
+                if early_response is not None:
+                    return early_response
+                tool_result = new_tool_result
                 continue
 
             # If none of the above matched, break
@@ -480,3 +315,235 @@ class ConversationOrchestrator:
         if logout_requested:
             result["logged_out"] = True
         return result
+
+    async def _handle_respond(
+        self,
+        *,
+        transcript: str,
+        session_id: str,
+        intent: Optional[str],
+        assistant_response: str,
+        reply_style: str,
+        logout_requested: bool,
+        tool_result: Any,
+        parsed: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Handle the "respond" action returned by the decision LLM.
+        Keeps the optional polishing hook (currently disabled) and
+        centralises logout detection before returning the final payload.
+        """
+        logger.info("Using LLM-provided response (action=respond) - checking if polishing needed")
+        should_polish = False  # Placeholder for future polishing heuristics
+        final_reply = assistant_response
+        if should_polish:
+            try:
+                polished = await self.agent.generate_response(
+                    intent or "unknown",
+                    (parsed or {}).get("tool_input", {}),
+                    tool_result,
+                    reply_style=reply_style,
+                )
+                final_reply = polished or assistant_response
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception(
+                    "Polishing failed: %s. Falling back to raw assistant_response",
+                    exc,
+                )
+                final_reply = assistant_response
+
+        logout_flag = logout_requested or self._detect_logout(transcript, final_reply, intent)
+
+        self.agent._append_history(session_id, {"role": "assistant", "text": final_reply})
+        logger.info("ORCHESTRATE - Complete (respond)")
+        result = {"status": "ok", "response": final_reply}
+        if logout_flag:
+            result["logged_out"] = True
+        return result
+
+    def _detect_logout(self, transcript: str, response: str, intent: Optional[str]) -> bool:
+        """
+        Detect whether the user or agent text implies a logout so downstream
+        handlers can clear the session.
+        """
+        lower_tx = (transcript or "").lower()
+        lower_resp = (response or "").lower()
+        intent_norm = (intent or "").lower() if intent else ""
+        logout_phrases = (
+            "logout",
+            "logged_out",
+            "log out",
+            "sign out",
+            "signout",
+            "log me out",
+            "log out now",
+            "signed out",
+        )
+        logout_intents = {"logout", "signout", "reset_session"}
+        return bool(
+            any(phrase in lower_tx for phrase in logout_phrases)
+            or any(phrase in lower_resp for phrase in logout_phrases)
+            or intent_norm in logout_intents
+        )
+
+    async def _handle_call_tool(
+        self,
+        *,
+        action: str,
+        intent: Optional[str],
+        tool_name: str,
+        tool_input: Any,
+        requires_tool: bool,
+        requires_confirmation: bool,
+        user_confirmation: Optional[bool],
+        assistant_response: Optional[str],
+        transcript: str,
+        session_id: str,
+        session_profile: Optional[Dict[str, Any]],
+        parse_only: bool,
+        reply_style: str,
+        iterations: int,
+        parsed: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[Dict[str, Any]], Any, bool]:
+        """
+        Handle tool execution including auth gating, confirmation prompts,
+        OTP triggers, and logging. Returns a tuple of:
+        (early_response_dict_or_None, tool_result, logout_flag)
+        """
+        logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
+
+        if tool_name == "logout_user":
+            response_text = assistant_response or "You are now logged out."
+            result = {"status": "ok", "response": response_text, "logged_out": True}
+            return result, None, True
+
+        auth_block = self._maybe_block_for_auth(
+            tool_name=tool_name,
+            session_id=session_id,
+            parse_only=parse_only,
+            iterations=iterations,
+            parsed=parsed,
+        )
+        if auth_block is not None:
+            return auth_block, None, False
+
+        otp_response = await self._maybe_trigger_otp(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            session_id=session_id,
+            session_profile=session_profile,
+            intent=intent,
+            parse_only=parse_only,
+        )
+        if otp_response is not None:
+            return otp_response, None, False
+
+        if requires_confirmation and not user_confirmation:
+            confirm_response = self._build_confirmation_response(
+                session_id=session_id,
+                intent=intent,
+                assistant_response=assistant_response,
+                iterations=iterations,
+            )
+            return confirm_response, None, False
+
+        tool_result = await self._execute_tool_safe(tool_name, tool_input)
+
+        return None, tool_result, False
+
+    def _maybe_block_for_auth(
+        self,
+        *,
+        tool_name: str,
+        session_id: str,
+        parse_only: bool,
+        iterations: int,
+        parsed: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        auth_tools = {
+            "register_user",
+            "login_user",
+            "set_user_audio_embedding",
+            "get_user_profile",
+            "list_tools",
+            "logout_user",
+        }
+        if not parse_only and not self.agent.is_authenticated(session_id) and tool_name not in auth_tools:
+            logger.info(
+                "AUTH: session %s not authenticated; prompting for login/registration before tool %s",
+                session_id,
+                tool_name,
+            )
+            state = self.agent._get_auth_state(session_id)
+            if not state.get("flow_stage"):
+                state["flow_stage"] = "await_choice"
+            msg = "You're not logged in yet. Would you like to login or register?"
+            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+            logger.info(
+                "ORCHESTRATE - Completed (auth_required before tool exec) at iter %d",
+                iterations,
+            )
+            logger.info("=" * 80)
+            return {"status": "clarify", "message": msg, "parsed": parsed}
+        return None
+
+    async def _maybe_trigger_otp(
+        self,
+        *,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        session_id: str,
+        session_profile: Optional[Dict[str, Any]],
+        intent: Optional[str],
+        parse_only: bool,
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name != "transfer" or parse_only:
+            return None
+        if not self.otp_workflow.should_trigger_transfer_otp(
+            session_id=session_id,
+            amount_value=tool_input.get("amount"),
+            session_profile=session_profile,
+        ):
+            return None
+        return await self.otp_workflow.initiate_transfer_otp(
+            session_id=session_id,
+            session_profile=session_profile,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            intent=intent,
+        )
+
+    def _build_confirmation_response(
+        self,
+        *,
+        session_id: str,
+        intent: Optional[str],
+        assistant_response: Optional[str],
+        iterations: int,
+    ) -> Dict[str, Any]:
+        confirm_msg = f"I will perform: {intent}. {assistant_response or 'Do you want to proceed?'}"
+        self.agent._append_history(session_id, {"role": "assistant", "text": confirm_msg})
+        logger.info(
+            "ORCHESTRATE - Completed (needs_confirmation before tool exec) at iter %d",
+            iterations,
+        )
+        logger.info("=" * 80)
+        return {"status": "needs_confirmation", "message": confirm_msg}
+
+    async def _execute_tool_safe(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+    ) -> tuple[Any, Dict[str, Any]]:
+        if not self.mcp_client:
+            logger.error("MCP client not configured - cannot execute tool")
+            return None, {"status": "not_configured", "message": "MCP client not set up."}
+
+        try:
+            logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, tool_input)
+            tool_result = await self.execute_tool(tool_name, tool_input)
+            logger.info("Tool result: %s", tool_result)
+            return tool_result
+        except Exception as exc:
+            logger.exception("Exception while executing tool %s: %s", tool_name, exc)
+            return None
