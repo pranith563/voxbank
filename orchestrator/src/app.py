@@ -29,7 +29,7 @@ from agent.agent import VoxBankAgent
 from agent.orchestrator import ConversationOrchestrator
 from gemini_llm_client import GeminiLLMClient
 from clients.mcp_client import MCPClient
-from context.session_manager import SessionManager
+from context.session_manager import get_session_manager
 from voice_processing import (
     transcribe_audio_to_text,
     synthesize_text_to_audio,
@@ -118,15 +118,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Session management
-# In-memory session manager (for demo/prototype). For prod, use Redis or DB.
-session_manager = SessionManager(
-    session_timeout_minutes=int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
-)
+# Session management (supports in-memory or Redis based on env vars)
+session_manager = get_session_manager()
 
-# Backwards-compat alias so any code that still reads SESSIONS
-# sees the same underlying dictionary.
-SESSIONS: Dict[str, Dict[str, Any]] = session_manager.sessions
+# Backwards-compat alias so any code that still reads SESSIONS sees the same storage.
+SESSIONS: Any = getattr(session_manager, "sessions", None)
 
 
 def get_session_profile(session_id: str) -> Dict[str, Any]:
@@ -389,6 +385,7 @@ async def hydrate_session_profile_from_mock_bank(session_id: str, user_id: str) 
     sess["beneficiaries"] = beneficiaries
     sess["primary_account"] = primary_account
     sess["is_authenticated"] = True
+    session_manager.save_session(session_id, sess)
 
 # Instantiate clients on startup
 @app.on_event("startup")
@@ -592,6 +589,7 @@ async def register_user(request: RegisterRequest):
             user_id = str(user.get("user_id"))
             sess = session_manager.ensure_session(request.session_id, user_id=user_id)
             sess["username"] = (user.get("username") or username_norm)
+            session_manager.save_session(request.session_id, sess)
             # Hydrate session profile (user_profile, accounts, primary_account, is_authenticated)
             try:
                 await hydrate_session_profile_from_mock_bank(request.session_id, user_id)
@@ -766,8 +764,8 @@ async def websocket_chat(ws: WebSocket):
                 current_session_id = session_id
 
                 # Ensure session exists and append history entry
-                session = session_manager.ensure_session(session_id, user_id=None)
-                session["history"].append({"role": "user", "text": transcript})
+                session_manager.ensure_session(session_id, user_id=None)
+                session_manager.add_history_message(session_id, "user", transcript)
 
                 try:
                     agent: VoxBankAgent = app.state.agent
@@ -784,7 +782,8 @@ async def websocket_chat(ws: WebSocket):
                     # If auth just completed, persist authenticated user_id into session and hydrate profile
                     auth_user_id = out.get("authenticated_user_id")
                     if auth_user_id:
-                        session["user_id"] = auth_user_id
+                        sess = session_manager.ensure_session(session_id, user_id=auth_user_id)
+                        session_manager.save_session(session_id, sess)
                         logger.info("Session %s authenticated as user %s (ws)", session_id, auth_user_id)
                         # best-effort: hydrate profile for this session
                         try:
@@ -794,7 +793,7 @@ async def websocket_chat(ws: WebSocket):
 
                     # Normal reply path
                     response_text = out.get("response") or out.get("message") or "I couldn't process that request right now."
-                    session["history"].append({"role": "assistant", "text": response_text})
+                    session_manager.add_history_message(session_id, "assistant", response_text)
 
                     # Optionally generate server-side TTS audio for this reply
                     if output_audio and response_text:
@@ -861,7 +860,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
 
     # initialize session if missing
     session = session_manager.ensure_session(session_id, user_id=user_id)
-    session["history"].append({"role": "user", "text": transcript})
+    session_manager.add_history_message(session_id, "user", transcript)
     logger.debug("Session state: %s", session)
 
     try:
@@ -884,6 +883,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
         if out.get("status") == "needs_confirmation":
             logger.info("Action requires confirmation")
             session["pending_action"] = {"parsed": out.get("parsed"), "transcript": transcript}
+            session_manager.save_session(session_id, session)
             resp_text = out.get("message", "Please confirm the action.")
             logger.info("Returning confirmation request: %s", resp_text)
             audio_url = None
@@ -918,6 +918,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
                     "tool_name": out.get("parsed", {}).get("tool_name"),
                     "tool_input": out.get("parsed", {}).get("tool_input", {})
                 }
+                session_manager.save_session(session_id, session)
             
             # Append assistant's clarification question to history
             session["history"].append({"role": "assistant", "text": clarify_message})
@@ -967,7 +968,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             except Exception as e:
                 logger.exception("Text TTS failed: %s", e)
 
-        session["history"].append({"role": "assistant", "text": response_text})
+        session_manager.add_history_message(session_id, "assistant", response_text)
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
         return TextResponse(

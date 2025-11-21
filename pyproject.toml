@@ -28,6 +28,7 @@ dependencies = [
     "webrtcvad>=2.0.10",
     "resemblyzer>=0.1.4",
     "openai>=2.8.1",
+    "redis>=5.0",
 ]
 
 [tool.uv]

@@ -12,17 +12,14 @@ import os
 import httpx
 
 from logging_config import get_logger
-from .session_manager import SessionManager
+from .session_manager import get_session_manager
 
 
 logger = get_logger("voxbank.orchestrator")
 
 VOX_BANK_BASE_URL = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
 
-# In-memory session manager (for demo/prototype). For prod, use Redis or DB.
-session_manager = SessionManager(
-    session_timeout_minutes=int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
-)
+session_manager = get_session_manager()
 
 
 def get_session_profile(session_id: str) -> Dict[str, Any]:
@@ -142,4 +139,3 @@ async def hydrate_session_profile_from_mock_bank(session_id: str, user_id: str) 
     sess["accounts"] = accounts_compact
     sess["primary_account"] = primary_account
     sess["is_authenticated"] = True
-

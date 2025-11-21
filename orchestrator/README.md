@@ -53,10 +53,12 @@ The orchestrator is a FastAPI service that hosts VoxBank’s LLM-based assistant
 
 Environment:
 
-- `GEMINI_API_KEY` – Gemini / GenAI API key.
-- `GEMINI_MODEL` – model name (e.g. `gemini-2.5-pro`).
-- `MCP_TOOL_BASE_URL` – base URL for MCP tools (default `http://localhost:9100`).
-- `SESSION_TIMEOUT_MINUTES` – in-memory session expiry.
+- `GEMINI_API_KEY` - Gemini / GenAI API key.
+- `GEMINI_MODEL` - model name (e.g. `gemini-2.5-pro`).
+- `MCP_TOOL_BASE_URL` - base URL for MCP tools (default `http://localhost:9100`).
+- `SESSION_TIMEOUT_MINUTES` - session expiry window in minutes.
+- `SESSION_BACKEND` - `memory` (default) or `redis` for multi-user / multi-instance deployments.
+- `SESSION_REDIS_URL` / `SESSION_REDIS_PREFIX` - required when using the Redis backend; lets all orchestrator instances share the same session map.
 
 Install & run (dev):
 
@@ -88,4 +90,3 @@ The orchestrator expects:
     - `POST /api/text/process` or `/api/text/respond` for chat.
     - `POST /api/voice/process` for voice.
     - `GET /ws` for low-latency streaming interactions.
-
