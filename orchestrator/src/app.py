@@ -36,8 +36,90 @@ from voice_processing import (
     audio_bytes_to_data_url,
     extract_voice_embedding,
 )
+from agent.helpers import translate_text
 
 VOX_BANK_BASE_URL = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
+
+LANGUAGE_PRESETS = {
+    "en": {"preferred": "en", "stt": "en-IN", "tts": "en-IN"},
+    "hi": {"preferred": "hi", "stt": "hi-IN", "tts": "hi-IN"},
+}
+LANGUAGE_DEFAULT = LANGUAGE_PRESETS["en"]
+
+
+def _resolve_language_preset(lang_value: Optional[str]) -> Dict[str, str]:
+    if not lang_value:
+        return LANGUAGE_DEFAULT
+    code = lang_value.strip().lower()
+    if code.startswith("hi"):
+        return LANGUAGE_PRESETS["hi"]
+    return LANGUAGE_PRESETS["en"]
+
+
+def _apply_language_settings(
+    session: Dict[str, Any],
+    session_id: str,
+    *candidates: Optional[str],
+) -> Dict[str, str]:
+    chosen: Optional[Dict[str, str]] = None
+    for candidate in candidates:
+        if candidate and candidate.strip():
+            chosen = _resolve_language_preset(candidate)
+            break
+    if chosen is None:
+        chosen = _resolve_language_preset(session.get("preferred_language"))
+
+    changed = (
+        session.get("preferred_language") != chosen["preferred"]
+        or session.get("stt_lang") != chosen["stt"]
+        or session.get("tts_lang") != chosen["tts"]
+    )
+
+    session["preferred_language"] = chosen["preferred"]
+    session["stt_lang"] = chosen["stt"]
+    session["tts_lang"] = chosen["tts"]
+
+    if changed:
+        session_manager.save_session(session_id, session)
+        logger.info(
+            "Session %s language -> preferred=%s stt=%s tts=%s",
+            session_id,
+            session["preferred_language"],
+            session["stt_lang"],
+            session["tts_lang"],
+        )
+    return chosen
+
+
+async def _translate_with_fallback(
+    text: Optional[str],
+    source_lang: str,
+    target_lang: str,
+    agent: VoxBankAgent,
+    log_prefix: str,
+) -> str:
+    if not text:
+        return ""
+    if source_lang.lower() == target_lang.lower():
+        return text
+    try:
+        translated = await translate_text(text, source_lang, target_lang, agent.call_llm)
+        logger.info(
+            "%s translation %s->%s succeeded",
+            log_prefix,
+            source_lang,
+            target_lang,
+        )
+        return translated.strip() or text
+    except Exception as exc:
+        logger.exception(
+            "%s translation failed (%s->%s): %s",
+            log_prefix,
+            source_lang,
+            target_lang,
+            exc,
+        )
+        return text
 
 
 
@@ -51,6 +133,9 @@ class TextRequest(BaseModel):
     reply_style: Optional[str] = "concise"  # 'concise' | 'detailed'
     # optional flag: also request audio TTS for this reply
     output_audio: Optional[bool] = False
+    # optional user language hint ("en", "hi", etc.)
+    language: Optional[str] = None
+    preferred_language: Optional[str] = None
 
 class TextResponse(BaseModel):
     response_text: str
@@ -64,6 +149,8 @@ class VoiceRequest(BaseModel):
     transcript: Optional[str] = None  # optional pre-transcribed text
     session_id: str
     user_id: str
+    language: Optional[str] = None
+    preferred_language: Optional[str] = None
 
 class ConfirmRequest(BaseModel):
     session_id: str
@@ -125,6 +212,39 @@ session_manager = get_session_manager()
 SESSIONS: Any = getattr(session_manager, "sessions", None)
 
 
+def perform_session_logout(session_id: str) -> None:
+    """
+    Clear authentication/session state for a given session_id.
+    Used by explicit logout endpoint and the logout_user MCP tool.
+    """
+    logger.info("Performing session logout for session_id=%s", session_id)
+    session = session_manager.get_session(session_id)
+    if session:
+        session["user_id"] = None
+        session["username"] = None
+        session["is_authenticated"] = False
+        session["is_voice_verified"] = False
+        session["primary_account"] = None
+        session["accounts"] = []
+        session["beneficiaries"] = []
+        session["user_profile"] = {}
+        session["pending_action"] = None
+        session["pending_clarification"] = None
+        session["context"] = {}
+        session["history"] = []
+        session["conversation_history"] = []
+        session["preferred_language"] = "en"
+        session["stt_lang"] = "en-IN"
+        session["tts_lang"] = "en-IN"
+        session_manager.save_session(session_id, session)
+
+    try:
+        agent: VoxBankAgent = app.state.agent
+        agent.auth_state.pop(session_id, None)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to clear agent auth state for session %s: %s", session_id, exc)
+
+
 def get_session_profile(session_id: str) -> Dict[str, Any]:
     """
     Return a compact session profile structure for the given session_id.
@@ -143,6 +263,9 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
             "primary_account": None,
             "accounts": [],
             "beneficiaries": [],
+            "preferred_language": "en",
+            "stt_lang": "en-IN",
+            "tts_lang": "en-IN",
         }
 
     profile = {
@@ -154,6 +277,9 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
         "accounts": sess.get("accounts") or [],
         "beneficiaries": sess.get("beneficiaries") or [],
         "user_profile": sess.get("user_profile") or {},
+        "preferred_language": sess.get("preferred_language") or "en",
+        "stt_lang": sess.get("stt_lang") or "en-IN",
+        "tts_lang": sess.get("tts_lang") or "en-IN",
     }
     logger.info(
         "Session profile for %s -> user_id=%s username=%s primary_account=%s accounts=%d",
@@ -516,26 +642,7 @@ async def logout(req: LogoutRequest):
     session_id = req.session_id
     logger.info("API Request: POST /api/auth/logout | session_id=%s", session_id)
 
-    # Clear orchestrator session
-    sess = session_manager.get_session(session_id)
-    if sess:
-        sess["user_id"] = None
-        sess["username"] = None
-        sess["pending_action"] = None
-        sess["pending_clarification"] = None
-
-    # Clear agent auth state
-    agent: VoxBankAgent = app.state.agent
-    if session_id in agent.auth_state:
-        try:
-            del agent.auth_state[session_id]
-        except Exception:
-            agent.auth_state[session_id] = {
-                "authenticated": False,
-                "user_id": None,
-                "flow_stage": None,
-                "temp": {},
-            }
+    perform_session_logout(session_id)
 
     return {"status": "ok"}
 
@@ -708,6 +815,7 @@ async def websocket_chat(ws: WebSocket):
     try:
         # Optional: track a session_id per connection
         current_session_id: Optional[str] = None
+        ws_lang_hint: Optional[str] = None
 
         while True:
             message = await ws.receive()
@@ -742,6 +850,7 @@ async def websocket_chat(ws: WebSocket):
                     data.get("encoding"),
                     data.get("lang"),
                 )
+                ws_lang_hint = data.get("lang")
                 await ws.send_text(json.dumps({"type": "meta_ack", "message": "meta received"}))
                 continue
 
@@ -764,20 +873,42 @@ async def websocket_chat(ws: WebSocket):
                 current_session_id = session_id
 
                 # Ensure session exists and append history entry
-                session_manager.ensure_session(session_id, user_id=None)
+                session = session_manager.ensure_session(session_id, user_id=None)
+                _apply_language_settings(
+                    session,
+                    session_id,
+                    data.get("preferred_language"),
+                    data.get("language"),
+                    ws_lang_hint,
+                )
                 session_manager.add_history_message(session_id, "user", transcript)
 
                 try:
                     agent: VoxBankAgent = app.state.agent
                     logger.info("WS: calling agent.orchestrate() for session %s", session_id)
                     profile = get_session_profile(session_id)
+                    user_lang = (profile.get("preferred_language") or "en").lower()
+                    logger.info("WS: preferred_language=%s", user_lang)
+                    effective_transcript = transcript
+                    if user_lang != "en":
+                        effective_transcript = await _translate_with_fallback(
+                            transcript,
+                            user_lang,
+                            "en",
+                            agent,
+                            f"ws_input:{session_id}",
+                        )
                     out = await agent.orchestrate(
-                        transcript,
+                        effective_transcript,
                         session_id,
                         user_confirmation=None,
                         session_profile=profile,
                     )
                     logger.info("WS: orchestrate returned status=%s", out.get("status"))
+                    logout_triggered = bool(out.get("logged_out"))
+                    if logout_triggered:
+                        perform_session_logout(session_id)
+                        logger.info("Session %s logged out via MCP tool (ws)", session_id)
 
                     # If auth just completed, persist authenticated user_id into session and hydrate profile
                     auth_user_id = out.get("authenticated_user_id")
@@ -792,8 +923,16 @@ async def websocket_chat(ws: WebSocket):
                             logger.exception("WS: failed to hydrate session profile after auth: %s", e)
 
                     # Normal reply path
-                    response_text = out.get("response") or out.get("message") or "I couldn't process that request right now."
-                    session_manager.add_history_message(session_id, "assistant", response_text)
+                    response_text_en = out.get("response") or out.get("message") or "I couldn't process that request right now."
+                    response_text = await _translate_with_fallback(
+                        response_text_en,
+                        "en",
+                        user_lang,
+                        agent,
+                        f"ws_response:{session_id}",
+                    )
+                    if not logout_triggered:
+                        session_manager.add_history_message(session_id, "assistant", response_text)
 
                     # Optionally generate server-side TTS audio for this reply
                     if output_audio and response_text:
@@ -820,6 +959,9 @@ async def websocket_chat(ws: WebSocket):
                             logger.exception("WS: TTS generation failed: %s", e)
 
                     await ws.send_text(json.dumps({"type": "reply", "text": response_text, "session_id": session_id}))
+                    if logout_triggered:
+                        # Ensure a fresh session on next turn
+                        session_manager.ensure_session(session_id, user_id=None)
                 except Exception as e:
                     logger.exception("WS: error during orchestrate: %s", e)
                     await ws.send_text(json.dumps({"type": "error", "message": "server_exception", "details": str(e)}))
@@ -860,6 +1002,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
 
     # initialize session if missing
     session = session_manager.ensure_session(session_id, user_id=user_id)
+    _apply_language_settings(session, session_id, request.preferred_language, request.language)
     session_manager.add_history_message(session_id, "user", transcript)
     logger.debug("Session state: %s", session)
 
@@ -869,22 +1012,52 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
 
         # Orchestrate (agent should return structure similar to voice flow)
         profile = get_session_profile(session_id)
+        user_lang = (profile.get("preferred_language") or "en").lower()
+        logger.info("Text process: preferred_language=%s", user_lang)
+        text_for_llm = transcript
+        if user_lang != "en":
+            text_for_llm = await _translate_with_fallback(
+                transcript,
+                user_lang,
+                "en",
+                agent,
+                f"text_input:{session_id}",
+            )
+
         out = await agent.orchestrate(
-            transcript,
+            text_for_llm,
             session_id,
             user_confirmation=None,
             session_profile=profile,
-        ) if hasattr(agent, "orchestrate") else await agent.process_user_input(transcript, session_id)
+        ) if hasattr(agent, "orchestrate") else await agent.process_user_input(text_for_llm, session_id)
         
         logger.info("Agent orchestrate returned: status=%s", out.get("status"))
         logger.debug("Full orchestrate response: %s", out)
 
+        logout_triggered = bool(out.get("logged_out"))
+        if logout_triggered:
+            perform_session_logout(session_id)
+            session = session_manager.ensure_session(session_id, user_id=None)
+            profile = get_session_profile(session_id)
+            logger.info("Session %s logged out via MCP tool", session_id)
+
         # If agent asks for confirmation (high-risk)
-        if out.get("status") == "needs_confirmation":
+        if not logout_triggered and out.get("status") == "needs_confirmation":
             logger.info("Action requires confirmation")
-            session["pending_action"] = {"parsed": out.get("parsed"), "transcript": transcript}
+            session["pending_action"] = {
+                "parsed": out.get("parsed"),
+                "transcript": transcript,
+                "transcript_en": text_for_llm,
+            }
             session_manager.save_session(session_id, session)
-            resp_text = out.get("message", "Please confirm the action.")
+            resp_text_en = out.get("message", "Please confirm the action.")
+            resp_text = await _translate_with_fallback(
+                resp_text_en,
+                "en",
+                user_lang,
+                agent,
+                f"text_confirm:{session_id}",
+            )
             logger.info("Returning confirmation request: %s", resp_text)
             audio_url = None
             if request.output_audio:
@@ -895,6 +1068,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
                         logger.info("Text TTS (confirm): generated audio (%d bytes) for session %s", len(audio_bytes), session_id)
                 except Exception as e:
                     logger.exception("Text TTS (confirm) failed: %s", e)
+            session_manager.add_history_message(session_id, "assistant", resp_text)
             return TextResponse(
                 response_text=resp_text,
                 session_id=session_id,
@@ -904,10 +1078,20 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             )
         
         # If agent needs clarification (missing information or auth/login)
-        elif out.get("status") == "clarify":
+        elif not logout_triggered and out.get("status") == "clarify":
             logger.info("Agent needs clarification from user")
             # Get the clarification message from the agent
-            clarify_message = out.get("message", "I need more information to help you. Could you please provide more details?")
+            clarify_message_en = out.get(
+                "message",
+                "I need more information to help you. Could you please provide more details?",
+            )
+            clarify_message = await _translate_with_fallback(
+                clarify_message_en,
+                "en",
+                user_lang,
+                agent,
+                f"text_clarify:{session_id}",
+            )
             logger.info("Returning clarification request: %s", clarify_message)
             
             # Store the partial parsed intent in session for context (optional, for better continuity)
@@ -922,6 +1106,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             
             # Append assistant's clarification question to history
             session["history"].append({"role": "assistant", "text": clarify_message})
+            session_manager.save_session(session_id, session)
             
             # Return clarification response (no confirmation needed, just asking for more info)
             audio_url = None
@@ -953,10 +1138,17 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
                 logger.exception("Text: failed to hydrate session profile after auth: %s", e)
 
         # Normal response path
-        response_text = out.get("response")
-        if not response_text:
+        response_text_en = out.get("response")
+        if not response_text_en:
             logger.error("Agent returned None response_text. Full output: %s", out)
-            response_text = "I apologize, but I'm having trouble processing your request. Please try again."
+            response_text_en = "I apologize, but I'm having trouble processing your request. Please try again."
+        response_text = await _translate_with_fallback(
+            response_text_en,
+            "en",
+            user_lang,
+            agent,
+            f"text_response:{session_id}",
+        )
 
         audio_url = None
         if request.output_audio:
@@ -968,7 +1160,8 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             except Exception as e:
                 logger.exception("Text TTS failed: %s", e)
 
-        session_manager.add_history_message(session_id, "assistant", response_text)
+        if not logout_triggered:
+            session_manager.add_history_message(session_id, "assistant", response_text)
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
         return TextResponse(
@@ -1114,16 +1307,29 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
 
     # initialize session if missing
     session = session_manager.ensure_session(session_id, user_id=user_id)
+    _apply_language_settings(session, session_id, request.preferred_language, request.language)
     session["history"].append({"role": "user", "text": transcript})
+    session_manager.save_session(session_id, session)
     logger.debug("Session state: %s", session)
 
     try:
         agent: VoxBankAgent = app.state.agent
         logger.info("Calling agent.orchestrate() for voice")
         profile = get_session_profile(session_id)
+        user_lang = (profile.get("preferred_language") or "en").lower()
+        logger.info("Voice process: preferred_language=%s", user_lang)
+        text_for_llm = transcript
+        if user_lang != "en":
+            text_for_llm = await _translate_with_fallback(
+                transcript,
+                user_lang,
+                "en",
+                agent,
+                f"voice_input:{session_id}",
+            )
         # Orchestrate: this will return needs_confirmation if LLM asks for it
         out = await agent.orchestrate(
-            transcript,
+            text_for_llm,
             session_id,
             user_confirmation=None,
             session_profile=profile,
@@ -1131,19 +1337,55 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
         logger.info("Agent orchestrate returned: status=%s", out.get("status"))
         logger.debug("Full orchestrate response: %s", out)
 
+        logout_triggered = bool(out.get("logged_out"))
+        if logout_triggered:
+            perform_session_logout(session_id)
+            session = session_manager.ensure_session(session_id, user_id=None)
+            profile = get_session_profile(session_id)
+            logger.info("Session %s logged out via MCP tool (voice)", session_id)
+
         # If agent returns needs_confirmation, store pending_action in session
         if out.get("status") == "needs_confirmation":
             logger.info("Action requires confirmation")
-            session["pending_action"] = {"parsed": out.get("parsed"), "transcript": transcript}
-            resp_text = out.get("message", "Please confirm the action.")
+            session["pending_action"] = {
+                "parsed": out.get("parsed"),
+                "transcript": transcript,
+                "transcript_en": text_for_llm,
+            }
+            session_manager.save_session(session_id, session)
+            resp_text_en = out.get("message", "Please confirm the action.")
+            resp_text = await _translate_with_fallback(
+                resp_text_en,
+                "en",
+                user_lang,
+                agent,
+                f"voice_confirm:{session_id}",
+            )
             logger.info("Returning confirmation request: %s", resp_text)
-            return VoiceResponse(response_text=resp_text, session_id=session_id, requires_confirmation=True, meta={"parsed": out.get("parsed")})
+            session["history"].append({"role": "assistant", "text": resp_text})
+            session_manager.save_session(session_id, session)
+            return VoiceResponse(
+                response_text=resp_text,
+                session_id=session_id,
+                requires_confirmation=True,
+                meta={"parsed": out.get("parsed")},
+            )
 
         # If agent needs clarification (missing information or auth/login)
         elif out.get("status") == "clarify":
             logger.info("Agent needs clarification from user")
             # Get the clarification message from the agent
-            clarify_message = out.get("message", "I need more information to help you. Could you please provide more details?")
+            clarify_message_en = out.get(
+                "message",
+                "I need more information to help you. Could you please provide more details?",
+            )
+            clarify_message = await _translate_with_fallback(
+                clarify_message_en,
+                "en",
+                user_lang,
+                agent,
+                f"voice_clarify:{session_id}",
+            )
             logger.info("Returning clarification request: %s", clarify_message)
             
             # Store the partial parsed intent in session for context (optional, for better continuity)
@@ -1154,16 +1396,18 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
                     "tool_name": out.get("parsed", {}).get("tool_name"),
                     "tool_input": out.get("parsed", {}).get("tool_input", {})
                 }
+                session_manager.save_session(session_id, session)
             
             # Append assistant's clarification question to history
             session["history"].append({"role": "assistant", "text": clarify_message})
+            session_manager.save_session(session_id, session)
             
             # Return clarification response (no confirmation needed, just asking for more info)
             return VoiceResponse(
-                response_text=clarify_message, 
-                session_id=session_id, 
-                requires_confirmation=False, 
-                meta={"parsed": out.get("parsed"), "status": "clarify"}
+                response_text=clarify_message,
+                session_id=session_id,
+                requires_confirmation=False,
+                meta={"parsed": out.get("parsed"), "status": "clarify"},
             )
 
         # If auth just completed, persist authenticated user_id into session and hydrate profile
@@ -1177,10 +1421,17 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
                 logger.exception("Voice: failed to hydrate session profile after auth: %s", e)
 
         # Normal completed response
-        response_text = out.get("response")
-        if not response_text:
+        response_text_en = out.get("response")
+        if not response_text_en:
             logger.error("Agent returned None response_text. Full output: %s", out)
-            response_text = "I apologize, but I'm having trouble processing your request. Please try again."
+            response_text_en = "I apologize, but I'm having trouble processing your request. Please try again."
+        response_text = await _translate_with_fallback(
+            response_text_en,
+            "en",
+            user_lang,
+            agent,
+            f"voice_response:{session_id}",
+        )
 
         # Run TTS to generate audio for voice clients (stub for now)
         audio_url: Optional[str] = None
@@ -1192,7 +1443,9 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
         except Exception as e:
             logger.exception("Voice TTS failed: %s", e)
 
-        session["history"].append({"role": "assistant", "text": response_text})
+        if not logout_triggered:
+            session["history"].append({"role": "assistant", "text": response_text})
+            session_manager.save_session(session_id, session)
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
         # Optionally run background tasks such as storing audit logs (placeholder)
@@ -1238,17 +1491,39 @@ async def confirm_action(request: ConfirmRequest):
     # User confirmed: re-run orchestration with confirmation flag
     try:
         agent: VoxBankAgent = app.state.agent
-        transcript = pending.get("transcript")
+        transcript = pending.get("transcript_en") or pending.get("transcript")
+        profile = get_session_profile(session_id)
+        user_lang = (profile.get("preferred_language") or "en").lower()
         # orchestrate with user_confirmation=True to perform the action
-        out = await agent.orchestrate(transcript, session_id, user_confirmation=True)
+        out = await agent.orchestrate(transcript, session_id, user_confirmation=True, session_profile=profile)
 
         # clear pending action
         session["pending_action"] = None
 
-        # append assistant message
-        session["history"].append({"role": "assistant", "text": out.get("response")})
+        logout_triggered = bool(out.get("logged_out"))
+        if logout_triggered:
+            perform_session_logout(session_id)
+            session = session_manager.ensure_session(session_id, user_id=None)
 
-        return VoiceResponse(response_text=out.get("response"), session_id=session_id, requires_confirmation=False, meta={"tool_result": out.get("tool_result")})
+        # append assistant message
+        response_text_en = out.get("response") or ""
+        response_text = await _translate_with_fallback(
+            response_text_en,
+            "en",
+            user_lang,
+            agent,
+            f"voice_confirm_final:{session_id}",
+        )
+        if not logout_triggered:
+            session["history"].append({"role": "assistant", "text": response_text})
+            session_manager.save_session(session_id, session)
+
+        return VoiceResponse(
+            response_text=response_text,
+            session_id=session_id,
+            requires_confirmation=False,
+            meta={"tool_result": out.get("tool_result")},
+        )
     except Exception as e:
         logger.exception("Error confirming action: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

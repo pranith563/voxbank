@@ -50,6 +50,9 @@ class SessionManager:
             # Simple cached profile info for tools/LLM
             "primary_account": None,
             "accounts": [],
+            "preferred_language": "en",
+            "stt_lang": "en-IN",
+            "tts_lang": "en-IN",
             "created_at": now,
             "last_activity": now,
             # High-level chat history used by the orchestrator (role/text)
@@ -80,6 +83,14 @@ class SessionManager:
         session = self.get_session(session_id)
         if session is None:
             session = self._init_session(session_id, user_id)
+        else:
+            # Backfill new fields that may have been introduced after the session was created
+            if "preferred_language" not in session:
+                session["preferred_language"] = "en"
+            if "stt_lang" not in session:
+                session["stt_lang"] = "en-IN"
+            if "tts_lang" not in session:
+                session["tts_lang"] = "en-IN"
         # Optionally refresh user_id if newly provided
         if user_id and not session.get("user_id"):
             session["user_id"] = user_id

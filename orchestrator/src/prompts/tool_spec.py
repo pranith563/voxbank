@@ -36,6 +36,10 @@ TOOL_SPEC = {
             "nickname": {"type": "string", "required": False},
             "account_number": {"type": "string", "required": True}
         }
+    },
+    "logout_user": {
+        "description": "Log out the current session/user and clear assistant state.",
+        "params": {}
     }
 }
 
@@ -138,6 +142,14 @@ TOOL_SPEC_V2 = {
         },
         "examples": [
             {"user_query": "Save John as a beneficiary", "tool_input": {"user_id": "USER_UUID", "nickname": "John", "account_number": "ACC002001"}}
+        ]
+    },
+    "logout_user": {
+        "description": "Log out the current session/user and clear the assistant state.",
+        "params": {},
+        "examples": [
+            {"user_query": "log me out", "tool_input": {}},
+            {"user_query": "reset my session", "tool_input": {}}
         ]
     }
 }

@@ -15,6 +15,11 @@ Your job in PRE-LOGIN mode is to:
 Conversation history (most recent turns):
 {history}
 
+LANGUAGE NOTE:
+- All internal logic and tool calls use English. By the time you see the transcript, it has already been normalized into English even if the user spoke another language.
+- Always return your response in English; another layer will translate it for the user.
+- Never translate or modify account numbers, phone numbers, amounts, or dates.
+
 Return ONLY a single JSON object (no extra text) with the exact fields described below.
 
 JSON RESPONSE FORMAT (STRICT):
@@ -43,4 +48,3 @@ IMPORTANT RULES:
   - provide a short, clear explanation about features and process.
 - Keep responses concise and deterministic. Do not add keys to the JSON.
 """
-

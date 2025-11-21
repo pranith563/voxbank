@@ -126,6 +126,13 @@ TOOL_METADATA = {
             "user_id": {"type": "string", "required": True},
         },
     },
+    "logout_user": {
+        "description": "Log out the current VoxBank user/session.",
+        "params": {
+            "user_id": {"type": "string", "required": False},
+            "session_id": {"type": "string", "required": False},
+        },
+    },
     "list_tools": {
         "description": "List available MCP tools",
         "params": {},
@@ -450,6 +457,20 @@ async def add_beneficiary(
         }
 
     return {"status": "success", "beneficiary": result["data"]}
+
+
+@mcp.tool(name="logout_user", description="Log out the current VoxBank user/session")
+async def logout_user(user_id: str | None = None, session_id: str | None = None) -> dict:
+    """
+    Simple acknowledgment tool. The orchestrator clears session/auth state after calling this.
+    """
+    logger.info("logout_user tool invoked (user_id=%s session_id=%s)", user_id, session_id)
+    return {
+        "status": "success",
+        "message": "Logout acknowledged.",
+        "user_id": user_id,
+        "session_id": session_id,
+    }
 
 
 @mcp.tool(name="list_tools", description="List available MCP tools")

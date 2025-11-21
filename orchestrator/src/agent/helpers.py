@@ -5,7 +5,7 @@ This file centralizes formatting, history rendering, and prompt-assembly
 helpers so that the main classes stay focused on core logic.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import json
 import re
 from decimal import Decimal
@@ -591,3 +591,50 @@ def normalize_tool_input_numeric(tool_name: str, tool_input: Optional[Dict[str, 
                 normalized[field] = value
 
     return normalized
+
+
+TranslatorCallable = Callable[..., Awaitable[str]]
+
+
+async def translate_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    call_llm: TranslatorCallable,
+) -> str:
+    """
+    Translate text between languages using the configured LLM client, keeping
+    numeric identifiers intact. Returns the original text if translation fails.
+    """
+    if not text:
+        return ""
+
+    if source_lang.strip().lower() == target_lang.strip().lower():
+        return text
+
+    prompt = (
+        "SYSTEM: You are a precise translator for a banking assistant.\n"
+        "Instructions:\n"
+        "- Translate from {source} to {target}.\n"
+        "- Never alter account numbers, card numbers, phone numbers, OTPs, or dates.\n"
+        "- Preserve numeric values exactly as provided.\n"
+        "- Respond with translation only, without commentary.\n\n"
+        "Input ({source}):\n"
+        "{text}\n\n"
+        "Output ({target}):"
+    ).format(source=source_lang, target=target_lang, text=text)
+
+    max_tokens = min(2048, max(60, len(text) + 50))
+
+    try:
+        translated = await call_llm(prompt, max_tokens=max_tokens, temperature=0.0)
+        if isinstance(translated, str):
+            return translated.strip() or text
+        return str(translated).strip() or text
+    except Exception:
+        logger.exception(
+            "translate_text: failed (%s -> %s)",
+            source_lang,
+            target_lang,
+        )
+        return text

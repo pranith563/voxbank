@@ -107,6 +107,7 @@ class ConversationOrchestrator:
         iterations = 0
         parsed: Optional[Dict[str, Any]] = None
         tool_result: Any = None
+        logout_requested = False
 
         # observation is the last tool output passed back into decision
         observation: Any = None
@@ -258,11 +259,22 @@ class ConversationOrchestrator:
 
                 self.agent._append_history(session_id, {"role": "assistant", "text": final_reply})
                 logger.info("ORCHESTRATE - Complete (respond)")
-                return {"status": "ok", "response": final_reply}
+                result = {"status": "ok", "response": final_reply}
+                if logout_requested:
+                    result["logged_out"] = True
+                return result
 
             # call_tool -> gate by auth, resolve accounts, execute tool, loop again
             if action == "call_tool" and requires_tool and tool_name:
                 logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                    if parsed is not None:
+                        parsed["tool_input"] = {}
+                if tool_name == "logout_user":
+                    tool_input.setdefault("session_id", session_id)
+                    if session_profile and session_profile.get("user_id"):
+                        tool_input.setdefault("user_id", session_profile.get("user_id"))
                 # Gate all non-auth tools behind login/registration.
                 auth_tools = {
                     "register_user",
@@ -270,6 +282,7 @@ class ConversationOrchestrator:
                     "set_user_audio_embedding",
                     "get_user_profile",
                     "list_tools",
+                    "logout_user",
                 }
                 if not parse_only and not self.agent.is_authenticated(session_id) and tool_name not in auth_tools:
                     logger.info(
@@ -384,6 +397,12 @@ class ConversationOrchestrator:
                     session_id,
                     {"role": "tool", "text": obs_summary, "detail": observation},
                 )
+                if (
+                    tool_name == "logout_user"
+                    and isinstance(observation, dict)
+                    and observation.get("status") == "success"
+                ):
+                    logout_requested = True
                 logger.info(
                     "Appended tool observation to history and continuing loop (iter %d)",
                     iterations,
@@ -416,4 +435,7 @@ class ConversationOrchestrator:
         self.agent._append_history(session_id, {"role": "assistant", "text": response_text})
         logger.info("ORCHESTRATE - Complete (final response)")
         logger.info("=" * 80)
-        return {"status": "ok", "response": response_text}
+        result = {"status": "ok", "response": response_text}
+        if logout_requested:
+            result["logged_out"] = True
+        return result
