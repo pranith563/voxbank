@@ -9,7 +9,6 @@ import httpx
 
 from otp_manager import OtpManager
 from .agent import VoxBankAgent
-from .helpers import format_observation_for_history
 
 logger = logging.getLogger("agent")
 
@@ -139,10 +138,9 @@ class OtpWorkflow:
             self.agent._append_history(session_id, {"role": "assistant", "text": msg})
             return {"status": "ok", "response": msg}
 
-        obs_summary = format_observation_for_history(tool_name, tool_result)
         self.agent._append_history(
             session_id,
-            {"role": "tool", "text": obs_summary, "detail": tool_result},
+            {"role": "tool", "detail": tool_result},
         )
 
         response_text = await self.agent.generate_response(

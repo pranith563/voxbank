@@ -82,27 +82,6 @@ def render_history_for_prompt(history: List[Dict[str, Any]], max_messages: int =
     return "\n".join(lines)
 
 
-def format_observation_for_history(tool_name: str, observation: Any) -> str:
-    """
-    Summarise a tool observation so it can be stored compactly in history.
-    """
-    try:
-        if isinstance(observation, dict):
-            if "balance" in observation:
-                return f"{tool_name} -> balance: {observation.get('balance')} {observation.get('currency', '')}"
-            if "transactions" in observation and isinstance(observation.get("transactions"), list):
-                return f"{tool_name} -> returned {len(observation.get('transactions'))} transactions"
-            if "status" in observation and observation.get("status") != "success":
-                return f"{tool_name} -> status: {observation.get('status')} - {str(observation.get('message', ''))}"
-            short = json.dumps(observation, default=str)
-            return f"{tool_name} -> {short[:200]}"
-        if isinstance(observation, list):
-            return f"{tool_name} -> list length {len(observation)}"
-        return f"{tool_name} -> {str(observation)[:200]}"
-    except Exception:
-        return f"{tool_name} -> (unserializable observation)"
-
-
 def resolve_account_from_profile(
     session_profile: Optional[Dict[str, Any]],
     label: Optional[str],

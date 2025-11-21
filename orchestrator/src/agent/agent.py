@@ -36,7 +36,6 @@ from .helpers import (
     mask_account,
     is_raw_tool_output,
     render_history_for_prompt,
-    format_observation_for_history,
     resolve_account_from_profile,
     deterministic_fallback,
     build_user_context_block,
@@ -139,9 +138,6 @@ class VoxBankAgent:
     def _render_history_for_prompt(self, session_id: str, max_messages: int = 40) -> str:
         history = self.get_history(session_id) or []
         return render_history_for_prompt(history, max_messages=max_messages)
-
-    def _format_observation_for_history(self, tool_name: str, observation: Any) -> str:
-        return format_observation_for_history(tool_name, observation)
 
     # ------------------------------------------------------------------
     # Auth state / login helpers
@@ -393,7 +389,6 @@ class VoxBankAgent:
         transcript: str,
         context: str,
         session_profile: Optional[Dict[str, Any]] = None,
-        observation: Optional[Any] = None,
         auth_state: Optional[bool] = None,
         max_tokens: int = 512,
         user_context_block: Optional[str] = None,
@@ -444,12 +439,6 @@ class VoxBankAgent:
             normalized_block = f"\n\nnormalized_input (JSON):\n{normalized_json}"
 
         prompt = f'{prompt}{normalized_block}\n\nUser request: "{transcript}"\n'
-        if observation is not None:
-            try:
-                obs_json = json.dumps(observation, default=str)
-            except Exception:
-                obs_json = str(observation)
-            prompt += f"\nObservation (from tool): {obs_json}\n"
         prompt += "\nReturn JSON now."
         
         raw = await self.call_llm(prompt, max_tokens=max_tokens)

@@ -18,7 +18,6 @@ from .agent import VoxBankAgent
 from .helpers import (
     build_user_context_block,
     render_history_for_prompt,
-    format_observation_for_history,
 )
 from .normalizer import normalize_input
 from .otp_workflow import OtpWorkflow
@@ -27,7 +26,7 @@ from .otp_workflow import OtpWorkflow
 logger = logging.getLogger("agent")
 
 class ConversationOrchestrator:
-    def __init__(self, agent: VoxBankAgent, mcp_client: Any, max_iters: int = 4) -> None:
+    def __init__(self, agent: VoxBankAgent, mcp_client: Any, max_iters: int = 10) -> None:
         self.agent = agent
         self.mcp_client = mcp_client
         self.max_iters = max_iters
@@ -57,7 +56,7 @@ class ConversationOrchestrator:
         """
         ReAct style orchestration loop:
         - call agent.decision()
-        - if decision -> call_tool: execute tool, append observation, call decision() again
+        - if decision -> call_tool: execute tool, call decision() again
         - otherwise handle respond / ask_user / ask_confirmation
 
         Behaviour and return shape are preserved from the legacy
@@ -124,9 +123,6 @@ class ConversationOrchestrator:
         tool_result: Any = None
         logout_requested = False
 
-        # observation is the last tool output passed back into decision
-        observation: Any = None
-
         # Normalize raw transcript once per turn via the small normalizer LLM
         history_for_norm = self.agent.get_history(session_id)
         last_assistant_msg = None
@@ -175,7 +171,7 @@ class ConversationOrchestrator:
             iterations += 1
             logger.info("ReAct loop iteration %d/%d", iterations, eff_max_iterations)
 
-            # Call decision with current transcript + context, auth state, and last observation (if any)
+            # Call decision with current transcript + context, auth state
             history = self.agent.get_history(session_id)
             context_str = render_history_for_prompt(history or [])
             user_context_block = build_user_context_block(session_profile) if session_profile else None
@@ -186,7 +182,6 @@ class ConversationOrchestrator:
                 effective_transcript,
                 context_str,
                 session_profile=session_profile,
-                observation=observation,
                 auth_state=auth_flag,
                 user_context_block=user_context_block,
                 tools_block=tools_block,
@@ -259,7 +254,7 @@ class ConversationOrchestrator:
                         polished = await self.agent.generate_response(
                             intent or "unknown",
                             parsed.get("tool_input", {}),
-                            tool_result or parsed.get("tool_output") or parsed.get("observation"),
+                            tool_result or parsed.get("tool_output"),
                             reply_style=reply_style,
                         )
                         final_reply = polished or assistant_response
@@ -441,36 +436,19 @@ class ConversationOrchestrator:
                 # Execute tool via MCP
                 if not self.mcp_client:
                     logger.error("MCP client not configured - cannot execute tool")
-                    observation = {"status": "not_configured", "message": "MCP client not set up."}
                 else:
                     try:
                         logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, tool_input)
                         tool_result = await self.execute_tool(tool_name, tool_input)
                         logger.info("Tool result: %s", tool_result)
-                        if isinstance(tool_result, (dict, list)):
-                            observation = tool_result
-                        else:
-                            observation = {"status": "ok", "result": str(tool_result)}
                     except Exception as e:
                         logger.exception("Exception while executing tool %s: %s", tool_name, e)
-                        observation = {"status": "error", "message": str(e)}
 
-                # Append observation and continue loop
-                obs_summary = format_observation_for_history(tool_name, observation)
-                self.agent._append_history(
-                    session_id,
-                    {"role": "tool", "text": obs_summary, "detail": observation},
-                )
+
                 if (
                     tool_name == "logout_user"
-                    and isinstance(observation, dict)
-                    and observation.get("status") == "success"
                 ):
                     logout_requested = True
-                logger.info(
-                    "Appended tool observation to history and continuing loop (iter %d)",
-                    iterations,
-                )
                 continue
 
             # If none of the above matched, break
@@ -484,13 +462,12 @@ class ConversationOrchestrator:
         # Reached end of loop: either no decision or max iterations hit
         logger.info("Exited ReAct loop after %d iterations", iterations)
 
-        # If we have a tool_result/observation, let generate_response combine it into final reply
+        # If we have a tool_result, let generate_response combine it into final reply
         response_text: Optional[str]
         try:
             response_text = await self.agent.generate_response(
                 intent or "unknown",
                 parsed.get("tool_input", {}) if parsed else {},
-                observation,
             )
         except Exception as e:
             logger.exception("Error generating final response: %s", e)
