@@ -10,6 +10,7 @@ been migrated here. VoxBankAgent is now responsible for LLM decisions,
 while ConversationOrchestrator owns tool execution and loop control.
 """
 
+import json
 import logging
 from typing import Any, Optional, Dict
 
@@ -169,6 +170,11 @@ class ConversationOrchestrator:
             normalized.get("primary_number"),
         )
 
+        # Append the new user message once per turn so history ordering is:
+        # ... assistant -> user -> (optional) tool -> assistant -> user -> ...
+        self.agent._append_history(session_id, {"role": "user", "text": effective_transcript})
+        logger.debug("Added user message to history")
+
         while iterations < eff_max_iterations:
             iterations += 1
             logger.info("ReAct loop iteration %d/%d", iterations, eff_max_iterations)
@@ -189,8 +195,6 @@ class ConversationOrchestrator:
                 tools_block=tools_block,
                 normalized_input=normalized,
             )
-            self.agent._append_history(session_id, {"role": "user", "text": effective_transcript})
-            logger.debug("Added user message to history")
 
             action = parsed.get("action")
             intent = parsed.get("intent")
@@ -284,6 +288,10 @@ class ConversationOrchestrator:
                 if early_response is not None:
                     return early_response
                 tool_result = new_tool_result
+                self.agent._append_history(
+                    session_id,
+                    {"role": "tool", "text": tool_result.data},
+                )
                 continue
 
             # If none of the above matched, break
@@ -412,6 +420,19 @@ class ConversationOrchestrator:
         """
         logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
 
+        # If the LLM has already produced a natural-language message before
+        # this tool call (e.g. "Let me check that for you"), record it as an
+        # assistant turn that also encodes which tool and inputs are being used.
+        
+        try:
+            tool_input_json = json.dumps(tool_input or {}, default=str)
+        except Exception:
+            tool_input_json = str(tool_input)
+        base_text = assistant_response
+        meta = f" [tool_name={tool_name}, input={tool_input_json}]"
+        assistant_call = f"{base_text}{meta}" if base_text else meta
+        self.agent._append_history(session_id, {"role": "assistant", "text": assistant_call})
+        
         if tool_name == "logout_user":
             response_text = assistant_response or "You are now logged out."
             result = {"status": "ok", "response": response_text, "logged_out": True}
@@ -661,3 +682,4 @@ class ConversationOrchestrator:
             if name not in payload or payload.get(name) in (None, "")
         ]
         return (len(missing) == 0, missing)
+

@@ -430,20 +430,11 @@ class VoxBankAgent:
                 .strip()
             )
 
-        normalized_block = ""
-        if normalized_input is not None:
-            try:
-                normalized_json = json.dumps(normalized_input, default=str)
-            except Exception:
-                normalized_json = str(normalized_input)
-            normalized_block = f"\n\nnormalized_input (JSON):\n{normalized_json}"
-
-        prompt = f'{prompt}{normalized_block}\n\nUser request: "{transcript}"\n'
         prompt += "\nReturn JSON now."
         
+        logger.info("----- PROMPT-----\n %s \n",prompt)
         raw = await self.call_llm(prompt, max_tokens=max_tokens)
-        
-        logger.info("LLM RESPOSNE: \n %s \n",raw);
+        logger.info("LLM RESPOSNE: \n %s \n",raw)
         # Use json_clean.validate_ai_json to robustly extract and parse JSON from LLM output
         parsed = None
         try:
