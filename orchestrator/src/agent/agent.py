@@ -451,10 +451,9 @@ class VoxBankAgent:
                 obs_json = str(observation)
             prompt += f"\nObservation (from tool): {obs_json}\n"
         prompt += "\nReturn JSON now."
-        logger.info("Calling LLM with prompt (length: %d chars)", len(prompt))
-        logger.info("PROMPT \n %s \n", prompt)
+        
         raw = await self.call_llm(prompt, max_tokens=max_tokens)
-        logger.info("LLM raw response received (length: %d chars)", len(raw) if raw else 0)
+        
         logger.info("LLM RESPOSNE: \n %s \n",raw);
         # Use json_clean.validate_ai_json to robustly extract and parse JSON from LLM output
         parsed = None

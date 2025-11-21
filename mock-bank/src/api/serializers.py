@@ -1,6 +1,6 @@
 from typing import Any, Dict
 
-from db.models import User, Account, Transaction, Beneficiary
+from db.models import User, Account, Transaction, Beneficiary, Card, Loan, Reminder
 
 
 def serialize_user(u: User) -> Dict[str, Any]:
@@ -68,3 +68,54 @@ def serialize_beneficiary(b: Beneficiary) -> Dict[str, Any]:
         "is_internal": bool(b.is_internal),
     }
 
+
+def serialize_card(c: Card) -> Dict[str, Any]:
+    return {
+        "card_id": str(c.card_id),
+        "user_id": str(c.user_id),
+        "account_id": str(c.account_id) if getattr(c, "account_id", None) else None,
+        "card_number": c.card_number,
+        "card_type": c.card_type,
+        "network": c.network,
+        "last4": c.last4,
+        "credit_limit": float(c.credit_limit) if c.credit_limit is not None else None,
+        "current_due": float(c.current_due) if c.current_due is not None else None,
+        "min_due": float(c.min_due) if c.min_due is not None else None,
+        "due_date": c.due_date.isoformat() if getattr(c, "due_date", None) else None,
+        "status": c.status,
+        "created_at": c.created_at.isoformat() if getattr(c, "created_at", None) else None,
+        "updated_at": c.updated_at.isoformat() if getattr(c, "updated_at", None) else None,
+    }
+
+
+def serialize_loan(l: Loan) -> Dict[str, Any]:
+    return {
+        "loan_id": str(l.loan_id),
+        "user_id": str(l.user_id),
+        "loan_type": l.loan_type,
+        "principal_amount": float(l.principal_amount) if l.principal_amount is not None else None,
+        "outstanding_amount": float(l.outstanding_amount) if l.outstanding_amount is not None else None,
+        "interest_rate": float(l.interest_rate) if l.interest_rate is not None else None,
+        "emi_amount": float(l.emi_amount) if l.emi_amount is not None else None,
+        "emi_day_of_month": l.emi_day_of_month,
+        "next_due_date": l.next_due_date.isoformat() if getattr(l, "next_due_date", None) else None,
+        "status": l.status,
+        "created_at": l.created_at.isoformat() if getattr(l, "created_at", None) else None,
+        "updated_at": l.updated_at.isoformat() if getattr(l, "updated_at", None) else None,
+    }
+
+
+def serialize_reminder(r: Reminder) -> Dict[str, Any]:
+    return {
+        "reminder_id": str(r.reminder_id),
+        "user_id": str(r.user_id),
+        "reminder_type": r.reminder_type,
+        "title": r.title,
+        "description": r.description,
+        "due_date": r.due_date.isoformat() if getattr(r, "due_date", None) else None,
+        "linked_loan_id": str(r.linked_loan_id) if getattr(r, "linked_loan_id", None) else None,
+        "linked_card_id": str(r.linked_card_id) if getattr(r, "linked_card_id", None) else None,
+        "status": r.status,
+        "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+        "updated_at": r.updated_at.isoformat() if getattr(r, "updated_at", None) else None,
+    }

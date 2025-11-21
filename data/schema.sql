@@ -112,30 +112,62 @@ CREATE INDEX idx_beneficiaries_account_number ON beneficiaries(beneficiary_accou
 
 CREATE TABLE cards (
     card_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id UUID NOT NULL REFERENCES accounts(account_id) ON DELETE RESTRICT,
-    card_number VARCHAR(19) UNIQUE NOT NULL,
-    card_type VARCHAR(20) NOT NULL CHECK (card_type IN ('debit', 'credit', 'prepaid')),
-    cardholder_name VARCHAR(255) NOT NULL,
-    expiry_month INTEGER NOT NULL CHECK (expiry_month BETWEEN 1 AND 12),
-    expiry_year INTEGER NOT NULL CHECK (expiry_year >= EXTRACT(YEAR FROM CURRENT_DATE)),
-    cvv VARCHAR(4) NOT NULL,
-    pin_hash VARCHAR(255),
-    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'blocked', 'expired', 'lost', 'stolen')),
-    daily_limit DECIMAL(15, 2) DEFAULT 5000.00,
-    monthly_limit DECIMAL(15, 2) DEFAULT 50000.00,
-    contactless_enabled BOOLEAN DEFAULT true,
-    online_transactions_enabled BOOLEAN DEFAULT true,
-    international_enabled BOOLEAN DEFAULT false,
-    issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_used_at TIMESTAMP,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id UUID REFERENCES accounts(account_id) ON DELETE SET NULL,
+    card_number VARCHAR(32) UNIQUE NOT NULL,
+    card_type VARCHAR(20) NOT NULL CHECK (card_type IN ('credit', 'debit')),
+    network VARCHAR(20),
+    last4 VARCHAR(4) NOT NULL,
+    credit_limit DECIMAL(15, 2),
+    current_due DECIMAL(15, 2),
+    min_due DECIMAL(15, 2),
+    due_date DATE,
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'blocked', 'inactive', 'closed')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX idx_cards_user_id ON cards(user_id);
 CREATE INDEX idx_cards_account_id ON cards(account_id);
-CREATE INDEX idx_cards_card_number ON cards(card_number);
 CREATE INDEX idx_cards_status ON cards(status);
-CREATE INDEX idx_cards_expiry ON cards(expiry_year, expiry_month);
+CREATE INDEX idx_cards_due_date ON cards(due_date);
+
+CREATE TABLE loans (
+    loan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    loan_type VARCHAR(50),
+    principal_amount DECIMAL(15, 2),
+    outstanding_amount DECIMAL(15, 2),
+    interest_rate DECIMAL(5, 2),
+    emi_amount DECIMAL(15, 2),
+    emi_day_of_month INTEGER,
+    next_due_date DATE,
+    status VARCHAR(20) DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_loans_user_id ON loans(user_id);
+CREATE INDEX idx_loans_status ON loans(status);
+CREATE INDEX idx_loans_next_due ON loans(next_due_date);
+
+CREATE TABLE reminders (
+    reminder_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    reminder_type VARCHAR(20),
+    title VARCHAR(255),
+    description TEXT,
+    due_date TIMESTAMP,
+    linked_loan_id UUID REFERENCES loans(loan_id) ON DELETE SET NULL,
+    linked_card_id UUID REFERENCES cards(card_id) ON DELETE SET NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_reminders_user_id ON reminders(user_id);
+CREATE INDEX idx_reminders_due_date ON reminders(due_date);
+CREATE INDEX idx_reminders_status ON reminders(status);
 
 CREATE TABLE audit_logs (
     log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -194,12 +226,24 @@ LEFT JOIN accounts ta ON t.to_account_id = ta.account_id;
 
 CREATE VIEW vw_card_details AS
 SELECT 
-    c.card_id, c.card_number, c.card_type, c.cardholder_name, c.expiry_month, c.expiry_year,
-    c.status AS card_status, c.daily_limit, c.monthly_limit,
-    a.account_id, a.account_number, a.account_type, a.balance, u.user_id, u.full_name, u.email
+    c.card_id,
+    c.card_type,
+    c.network,
+    c.last4,
+    c.credit_limit,
+    c.current_due,
+    c.min_due,
+    c.due_date,
+    c.status AS card_status,
+    c.account_id,
+    a.account_number,
+    u.user_id,
+    u.full_name,
+    u.email,
+    u.username
 FROM cards c
-JOIN accounts a ON c.account_id = a.account_id
-JOIN users u ON a.user_id = u.user_id;
+LEFT JOIN accounts a ON c.account_id = a.account_id
+JOIN users u ON c.user_id = u.user_id;
 
 -- ============================================================================
 -- FUNCTIONS
@@ -240,6 +284,8 @@ CREATE TRIGGER update_accounts_updated_at BEFORE UPDATE ON accounts FOR EACH ROW
 CREATE TRIGGER update_transactions_updated_at BEFORE UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_beneficiaries_updated_at BEFORE UPDATE ON beneficiaries FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_cards_updated_at BEFORE UPDATE ON cards FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_loans_updated_at BEFORE UPDATE ON loans FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_reminders_updated_at BEFORE UPDATE ON reminders FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 
 
@@ -312,16 +358,23 @@ INSERT INTO beneficiaries (beneficiary_id, user_id, beneficiary_account_number, 
 -- SAMPLE CARDS
 -- ============================================================================
 
-INSERT INTO cards (card_id, account_id, card_number, card_type, cardholder_name, expiry_month, expiry_year, cvv, pin_hash, status, daily_limit, monthly_limit, contactless_enabled, online_transactions_enabled, international_enabled, last_used_at) VALUES
-('990e8400-e29b-41d4-a716-446655440001', '660e8400-e29b-41d4-a716-446655440001', '4532-1234-5678-9012', 'debit', 'JOHN DOE', 12, 2027, '123', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 2500.00, 25000.00, true, true, false, NOW() - INTERVAL '2 days'),
-('990e8400-e29b-41d4-a716-446655440002', '660e8400-e29b-41d4-a716-446655440002', '4532-2345-6789-0123', 'debit', 'JOHN DOE', 8, 2028, '456', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 1000.00, 10000.00, true, true, false, NOW() - INTERVAL '1 week'),
-('990e8400-e29b-41d4-a716-446655440003', '660e8400-e29b-41d4-a716-446655440003', '4532-3456-7890-1234', 'debit', 'JANE SMITH', 6, 2027, '789', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 3000.00, 30000.00, true, true, true, NOW() - INTERVAL '4 days'),
-('990e8400-e29b-41d4-a716-446655440004', '660e8400-e29b-41d4-a716-446655440004', '4532-4567-8901-2345', 'debit', 'JANE SMITH', 3, 2029, '012', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 1500.00, 15000.00, true, false, false, NOW() - INTERVAL '10 days'),
-('990e8400-e29b-41d4-a716-446655440005', '660e8400-e29b-41d4-a716-446655440005', '4532-5678-9012-3456', 'debit', 'MIKE WILSON', 11, 2026, '345', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 2000.00, 20000.00, false, true, false, NOW() - INTERVAL '1 day'),
-('990e8400-e29b-41d4-a716-446655440006', '660e8400-e29b-41d4-a716-446655440006', '4532-6789-0123-4567', 'debit', 'SARAH BROWN', 9, 2028, '678', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 4000.00, 40000.00, true, true, true, NOW() - INTERVAL '3 hours'),
-('990e8400-e29b-41d4-a716-446655440007', '660e8400-e29b-41d4-a716-446655440007', '4532-7890-1234-5678', 'credit', 'SARAH BROWN', 5, 2027, '901', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'active', 10000.00, 100000.00, true, true, true, NOW() - INTERVAL '5 days'),
-('990e8400-e29b-41d4-a716-446655440008', '660e8400-e29b-41d4-a716-446655440008', '4532-8901-2345-6789', 'debit', 'DAVID JONES', 2, 2026, '234', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj/VjPoyNdO2', 'blocked', 5000.00, 50000.00, true, true, false, NOW() - INTERVAL '2 weeks');
+INSERT INTO cards (card_id, user_id, account_id, card_number, card_type, network, last4, credit_limit, current_due, min_due, due_date, status, created_at) VALUES
+('990e8400-e29b-41d4-a716-446655440001', '550e8400-e29b-41d4-a716-446655440001', '660e8400-e29b-41d4-a716-446655440001', 'CARD000001', 'credit', 'VISA', '9012', 5000.00, 450.75, 50.00, CURRENT_DATE + INTERVAL '10 days', 'active', NOW() - INTERVAL '2 days'),
+('990e8400-e29b-41d4-a716-446655440002', '550e8400-e29b-41d4-a716-446655440001', '660e8400-e29b-41d4-a716-446655440002', 'CARD000002', 'debit', 'MASTERCARD', '0123', NULL, NULL, NULL, NULL, 'active', NOW() - INTERVAL '1 week'),
+('990e8400-e29b-41d4-a716-446655440003', '550e8400-e29b-41d4-a716-446655440002', '660e8400-e29b-41d4-a716-446655440003', 'CARD000003', 'credit', 'VISA', '1234', 8000.00, 1200.00, 120.00, CURRENT_DATE + INTERVAL '18 days', 'active', NOW() - INTERVAL '4 days'),
+('990e8400-e29b-41d4-a716-446655440004', '550e8400-e29b-41d4-a716-446655440002', '660e8400-e29b-41d4-a716-446655440004', 'CARD000004', 'credit', 'MASTERCARD', '2345', 3000.00, 0.00, 0.00, CURRENT_DATE + INTERVAL '25 days', 'active', NOW() - INTERVAL '10 days'),
+('990e8400-e29b-41d4-a716-446655440005', '550e8400-e29b-41d4-a716-446655440003', '660e8400-e29b-41d4-a716-446655440005', 'CARD000005', 'credit', 'AMEX', '3456', 10000.00, 2200.50, 200.00, CURRENT_DATE + INTERVAL '5 days', 'active', NOW() - INTERVAL '1 day'),
+('990e8400-e29b-41d4-a716-446655440006', '550e8400-e29b-41d4-a716-446655440004', NULL, 'CARD000006', 'debit', 'VISA', '4567', NULL, NULL, NULL, NULL, 'active', NOW() - INTERVAL '12 days');
 
+INSERT INTO loans (loan_id, user_id, loan_type, principal_amount, outstanding_amount, interest_rate, emi_amount, emi_day_of_month, next_due_date, status, created_at) VALUES
+('880e8400-e29b-41d4-a716-446655440001', '550e8400-e29b-41d4-a716-446655440001', 'home_loan', 250000.00, 187500.00, 6.50, 1850.00, 5, CURRENT_DATE + INTERVAL '5 days', 'active', NOW() - INTERVAL '30 days'),
+('880e8400-e29b-41d4-a716-446655440002', '550e8400-e29b-41d4-a716-446655440002', 'auto_loan', 32000.00, 12000.00, 7.25, 520.00, 12, CURRENT_DATE + INTERVAL '12 days', 'active', NOW() - INTERVAL '60 days'),
+('880e8400-e29b-41d4-a716-446655440003', '550e8400-e29b-41d4-a716-446655440003', 'personal_loan', 15000.00, 4000.00, 12.50, 430.00, 18, CURRENT_DATE + INTERVAL '18 days', 'active', NOW() - INTERVAL '20 days');
+
+INSERT INTO reminders (reminder_id, user_id, reminder_type, title, description, due_date, linked_loan_id, linked_card_id, status, created_at) VALUES
+('770e8400-e29b-41d4-a716-446655440001', '550e8400-e29b-41d4-a716-446655440001', 'emi', 'Home loan EMI due', 'Pay the upcoming home loan EMI.', CURRENT_TIMESTAMP + INTERVAL '4 days', '880e8400-e29b-41d4-a716-446655440001', NULL, 'pending', NOW()),
+('770e8400-e29b-41d4-a716-446655440002', '550e8400-e29b-41d4-a716-446655440002', 'card_due', 'Credit card bill', 'Minimum due for Visa card.', CURRENT_TIMESTAMP + INTERVAL '8 days', NULL, '990e8400-e29b-41d4-a716-446655440003', 'pending', NOW()),
+('770e8400-e29b-41d4-a716-446655440003', '550e8400-e29b-41d4-a716-446655440003', 'emi', 'Auto debit reminder', 'Auto debit for personal loan EMI.', CURRENT_TIMESTAMP + INTERVAL '16 days', '880e8400-e29b-41d4-a716-446655440003', NULL, 'pending', NOW());
 -- ============================================================================
 -- SAMPLE AUDIT LOGS
 -- ============================================================================

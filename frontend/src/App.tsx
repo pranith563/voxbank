@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import "./index.css";
 import Register from "./Register";
 import VoiceSearchGeminiBrowser from "./VoiceSearchGeminiBrowser";
@@ -59,16 +59,18 @@ function App() {
     };
   }, [sessionId]);
 
-  function handleLogout() {
-    // Inform orchestrator to clear auth state for this session (best-effort)
-    try {
-      fetch("/api/auth/logout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId }),
-      }).catch(() => undefined);
-    } catch {
-      // ignore
+  function handleLogout(options?: { skipServer?: boolean }) {
+    const skipServer = options?.skipServer ?? false;
+    if (!skipServer) {
+      try {
+        fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        }).catch(() => undefined);
+      } catch {
+        // ignore
+      }
     }
 
     setCurrentUser(null);
@@ -81,6 +83,10 @@ function App() {
       window.localStorage.removeItem("voxbank_username");
     }
   }
+
+  const handleForcedLogout = useCallback(() => {
+    handleLogout({ skipServer: true });
+  }, [sessionId]);
 
   return (
     <div className="min-h-screen bg-white">
@@ -160,7 +166,12 @@ function App() {
       <main className="pt-20">
         <div className="max-w-6xl mx-auto px-6 py-12">
           {view === "assistant" && (
-            <VoiceSearchGeminiBrowser language={language} voiceType={voiceType} sessionId={sessionId} />
+            <VoiceSearchGeminiBrowser
+              language={language}
+              voiceType={voiceType}
+              sessionId={sessionId}
+              onForceLogout={handleForcedLogout}
+            />
           )}
           {view === "register" && (
             <Register

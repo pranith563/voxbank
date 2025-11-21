@@ -1,5 +1,6 @@
 import base64
 import io
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
@@ -7,7 +8,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import select, func
 
-from db.models import User, Account, Beneficiary
+from db.models import User, Account, Beneficiary, Card, Loan, Reminder
 from logging_config import get_logger
 from .deps import get_db
 from .schemas import (
@@ -20,8 +21,18 @@ from .schemas import (
     AccountOut,
     BeneficiaryOut,
     BeneficiaryCreate,
+    CardOut,
+    LoanOut,
+    ReminderOut,
 )
-from .serializers import serialize_account, serialize_user, serialize_beneficiary
+from .serializers import (
+    serialize_account,
+    serialize_user,
+    serialize_beneficiary,
+    serialize_card,
+    serialize_loan,
+    serialize_reminder,
+)
 
 logger = get_logger("mock_bank.api.users")
 
@@ -63,6 +74,28 @@ def _extract_voice_embedding(audio_bytes: bytes) -> Optional[list[float]]:
     # Stub fallback: deterministic vector based on length only.
     length = float(len(audio_bytes))
     return [length, 0.0, 0.0]
+
+
+async def _generate_account_number(db) -> str:
+    try:
+        stmt = select(func.count()).select_from(Account)
+        res = await db.execute(stmt)
+        current_count = res.scalar_one() or 0
+        return f"ACC{current_count + 1:06d}"
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.exception("create_user: failed to compute next account number; using fallback: %s", e)
+        return f"ACC{uuid4().hex[:8].upper()}"
+
+
+async def _generate_card_number(db) -> str:
+    try:
+        stmt = select(func.count()).select_from(Card)
+        res = await db.execute(stmt)
+        current_count = res.scalar_one() or 0
+        return f"CARD{current_count + 1:06d}"
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.exception("create_user: failed to compute next card number; using fallback: %s", e)
+        return f"CARD{uuid4().hex[:8].upper()}"
 
 
 @router.get("/list_users", response_model=List[UserOut])
@@ -145,24 +178,11 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         except Exception as e:
             logger.exception("create_user: failed to decode audio_data: %s", e)
 
-    # Generate a deterministic default savings account number for this prototype.
-    # We use the current count of accounts to form ACC000001, ACC000002, ...
-    acct_number = None
-    try:
-        count_stmt = select(func.count()).select_from(Account)
-        count_res = await db.execute(count_stmt)
-        current_count = count_res.scalar_one() or 0
-        acct_number = f"ACC{current_count + 1:06d}"
-    except Exception as e:
-        logger.exception("create_user: failed to compute next account number; falling back to random: %s", e)
-        # very low collision risk; acceptable for prototype
-        acct_number = f"ACC{uuid4().hex[:8].upper()}"
-
-    # Create user first with an explicit UUID so we can safely link the default
-    # account without relying on server-side key generation.
+    acct_number = await _generate_account_number(db)
+    card_number = await _generate_card_number(db)
     new_user_id = uuid4()
 
-    u = User(
+    user_obj = User(
         user_id=new_user_id,
         username=username_norm,
         email=email,
@@ -170,40 +190,79 @@ async def create_user(payload: UserCreate, db=Depends(get_db)):
         full_name=payload.full_name,
         phone_number=payload.phone_number,
         address=payload.address,
-        # date_of_birth is accepted as an ISO string; parsing can be added if needed.
         passphrase=passphrase_norm,
         audio_embedding=audio_embedding,
     )
 
-    default_balance = Decimal("5000.00")
-    # Add user and flush so we have a concrete user_id for the FK
-    db.add(u)
-    await db.flush()
+    account_obj = None
+    card_obj = None
+    loan_obj = None
 
-    acct = Account(
-        account_id=uuid4(),
-        account_number=acct_number,
-        user_id=new_user_id,
-        account_type="savings",
-        currency="USD",
-        balance=default_balance,
-        available_balance=default_balance,
-        status="active",
-    )
-    db.add(acct)
+    try:
+        db.add(user_obj)
+        await db.flush()
 
-    # Commit both user and default account in a single transaction
-    await db.commit()
-    await db.refresh(u)
-    await db.refresh(acct)
+        default_balance = Decimal("5000.00")
+        account_obj = Account(
+            account_id=uuid4(),
+            account_number=acct_number,
+            user_id=new_user_id,
+            account_type="savings",
+            currency="USD",
+            balance=default_balance,
+            available_balance=default_balance,
+            status="active",
+        )
+        db.add(account_obj)
+        await db.flush()
+
+        card_obj = Card(
+            card_id=uuid4(),
+            user_id=new_user_id,
+            account_id=account_obj.account_id,
+            card_number=card_number,
+            card_type="credit",
+            network="VISA",
+            last4=card_number[-4:],
+            credit_limit=Decimal("100000.00"),
+            current_due=Decimal("2500.00"),
+            min_due=Decimal("500.00"),
+            due_date=datetime.utcnow().date() + timedelta(days=15),
+            status="active",
+        )
+        db.add(card_obj)
+
+        loan_obj = Loan(
+            loan_id=uuid4(),
+            user_id=new_user_id,
+            loan_type="personal_loan",
+            principal_amount=Decimal("200000.00"),
+            outstanding_amount=Decimal("150000.00"),
+            interest_rate=Decimal("12.0"),
+            emi_amount=Decimal("5000.00"),
+            emi_day_of_month=5,
+            next_due_date=datetime.utcnow().date() + timedelta(days=5),
+            status="active",
+        )
+        db.add(loan_obj)
+
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.exception("create_user: failed to create user with defaults: %s", e)
+        raise
+
+    await db.refresh(user_obj)
+
     logger.info(
-        "Created user user_id=%s username=%s with default savings account %s balance=%s",
-        u.user_id,
-        u.username,
-        acct.account_number,
-        acct.balance,
+        "Created user user_id=%s username=%s with default account=%s card=%s loan=%s",
+        user_obj.user_id,
+        user_obj.username,
+        account_obj.account_number if account_obj else None,
+        card_obj.card_number if card_obj else None,
+        loan_obj.loan_type if loan_obj else None,
     )
-    return serialize_user(u)
+    return serialize_user(user_obj)
 
 
 @router.post("/register", response_model=UserOut)
@@ -378,3 +437,74 @@ async def create_beneficiary_for_user(
         b.beneficiary_account_number,
     )
     return serialize_beneficiary(b)
+
+
+@router.get("/users/{user_id}/cards", response_model=List[CardOut])
+async def get_user_cards(user_id: UUID, db=Depends(get_db)):
+    """
+    Return all cards linked to a user.
+    """
+    logger.info("Fetching cards for user_id=%s", user_id)
+    stmt_user = select(User).where(User.user_id == user_id)
+    res_user = await db.execute(stmt_user)
+    if not res_user.scalars().first():
+        logger.warning("User not found when fetching cards user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stmt = select(Card).where(Card.user_id == user_id).order_by(Card.created_at.desc())
+    res = await db.execute(stmt)
+    cards = res.scalars().all()
+    return [serialize_card(c) for c in cards]
+
+
+@router.get("/users/{user_id}/loans", response_model=List[LoanOut])
+async def get_user_loans(user_id: UUID, db=Depends(get_db)):
+    """
+    Return all active loans for a user.
+    """
+    logger.info("Fetching loans for user_id=%s", user_id)
+    stmt_user = select(User).where(User.user_id == user_id)
+    res_user = await db.execute(stmt_user)
+    if not res_user.scalars().first():
+        logger.warning("User not found when fetching loans user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stmt = (
+        select(Loan)
+        .where(Loan.user_id == user_id)
+        .where((Loan.status == "active") | (Loan.status.is_(None)))
+        .order_by(Loan.created_at.desc())
+    )
+    res = await db.execute(stmt)
+    loans = res.scalars().all()
+    return [serialize_loan(l) for l in loans]
+
+
+@router.get("/users/{user_id}/reminders", response_model=List[ReminderOut])
+async def get_user_reminders(
+    user_id: UUID,
+    upcoming: bool = False,
+    days: int = 30,
+    db=Depends(get_db),
+):
+    """
+    Return reminders for a user. When upcoming=true, filters to reminders within the next N days.
+    """
+    logger.info("Fetching reminders for user_id=%s upcoming=%s days=%s", user_id, upcoming, days)
+    stmt_user = select(User).where(User.user_id == user_id)
+    res_user = await db.execute(stmt_user)
+    if not res_user.scalars().first():
+        logger.warning("User not found when fetching reminders user_id=%s", user_id)
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stmt = select(Reminder).where(Reminder.user_id == user_id).order_by(Reminder.due_date.asc())
+
+    if upcoming:
+        now = datetime.utcnow()
+        window_end = now + timedelta(days=max(days, 1))
+        stmt = stmt.where(Reminder.due_date.isnot(None))
+        stmt = stmt.where(Reminder.due_date >= now).where(Reminder.due_date <= window_end)
+
+    res = await db.execute(stmt)
+    reminders = res.scalars().all()
+    return [serialize_reminder(r) for r in reminders]

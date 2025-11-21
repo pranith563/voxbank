@@ -143,6 +143,7 @@ class TextResponse(BaseModel):
     requires_confirmation: bool = False
     audio_url: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
+    logged_out: bool = False
 
 class VoiceRequest(BaseModel):
     audio_data: Optional[str] = None  # base64-encoded audio (optional)
@@ -164,6 +165,7 @@ class VoiceResponse(BaseModel):
     session_id: str
     requires_confirmation: bool = False
     meta: Optional[Dict[str, Any]] = None
+    logged_out: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -958,9 +960,16 @@ async def websocket_chat(ws: WebSocket):
                         except Exception as e:
                             logger.exception("WS: TTS generation failed: %s", e)
 
-                    await ws.send_text(json.dumps({"type": "reply", "text": response_text, "session_id": session_id}))
+                    reply_payload = {
+                        "type": "reply",
+                        "text": response_text,
+                        "session_id": session_id,
+                        "logged_out": logout_triggered,
+                    }
+                    await ws.send_text(json.dumps(reply_payload))
                     if logout_triggered:
-                        # Ensure a fresh session on next turn
+                        await ws.send_text(json.dumps({"type": "logout", "session_id": session_id}))
+                        # ensure a clean session on next turn
                         session_manager.ensure_session(session_id, user_id=None)
                 except Exception as e:
                     logger.exception("WS: error during orchestrate: %s", e)
@@ -1000,8 +1009,12 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
     session_id = request.session_id
     user_id = request.user_id
 
-    # initialize session if missing
-    session = session_manager.ensure_session(session_id, user_id=user_id)
+    # initialize session (only trust user_id when session is brand new)
+    existing_session = session_manager.get_session(session_id)
+    if existing_session is None:
+        session = session_manager.ensure_session(session_id, user_id=user_id)
+    else:
+        session = session_manager.ensure_session(session_id, user_id=None)
     _apply_language_settings(session, session_id, request.preferred_language, request.language)
     session_manager.add_history_message(session_id, "user", transcript)
     logger.debug("Session state: %s", session)
@@ -1075,6 +1088,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
                 requires_confirmation=True,
                 audio_url=audio_url,
                 meta={"parsed": out.get("parsed")},
+                logged_out=logout_triggered,
             )
         
         # If agent needs clarification (missing information or auth/login)
@@ -1125,6 +1139,7 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
                 requires_confirmation=False,
                 audio_url=audio_url,
                 meta={"parsed": out.get("parsed"), "status": "clarify"},
+                logged_out=logout_triggered,
             )
         
         # If auth just completed, persist authenticated user_id into session
@@ -1162,6 +1177,12 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
 
         if not logout_triggered:
             session_manager.add_history_message(session_id, "assistant", response_text)
+
+        response_meta: Dict[str, Any] = {}
+        if logout_triggered:
+            response_meta["logged_out"] = True
+        if out.get("tool_result") is not None:
+            response_meta.setdefault("tool_result", out.get("tool_result"))
         logger.info("Returning successful response: %s", response_text[:100] + "..." if len(response_text) > 100 else response_text)
         logger.info("=" * 80)
         return TextResponse(
@@ -1169,6 +1190,8 @@ async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
             session_id=session_id,
             requires_confirmation=False,
             audio_url=audio_url,
+            meta=response_meta or None,
+            logged_out=logout_triggered,
         )
 
     except Exception as e:
@@ -1254,7 +1277,12 @@ async def text_respond(req: TextRequest):
         session_id = req.session_id
         session = session_manager.ensure_session(session_id, user_id=req.user_id)
         session["history"].append({"role": "assistant", "text": response_text})
-        return TextResponse(response_text=response_text, session_id=session_id, requires_confirmation=False)
+        return TextResponse(
+            response_text=response_text,
+            session_id=session_id,
+            requires_confirmation=False,
+            logged_out=False,
+        )
     except Exception as e:
         logger.exception("LLM generate failed: %s", e)
         raise HTTPException(status_code=500, detail="LLM error")
@@ -1305,8 +1333,11 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
         logger.warning("Voice: STT returned empty transcript")
         raise HTTPException(status_code=400, detail="Could not derive transcript from audio")
 
-    # initialize session if missing
-    session = session_manager.ensure_session(session_id, user_id=user_id)
+    existing_session = session_manager.get_session(session_id)
+    if existing_session is None:
+        session = session_manager.ensure_session(session_id, user_id=user_id)
+    else:
+        session = session_manager.ensure_session(session_id, user_id=None)
     _apply_language_settings(session, session_id, request.preferred_language, request.language)
     session["history"].append({"role": "user", "text": transcript})
     session_manager.save_session(session_id, session)
@@ -1362,13 +1393,18 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
                 f"voice_confirm:{session_id}",
             )
             logger.info("Returning confirmation request: %s", resp_text)
-            session["history"].append({"role": "assistant", "text": resp_text})
-            session_manager.save_session(session_id, session)
+            if not logout_triggered:
+                session["history"].append({"role": "assistant", "text": resp_text})
+                session_manager.save_session(session_id, session)
+            meta_payload: Dict[str, Any] = {"parsed": out.get("parsed")}
+            if logout_triggered:
+                meta_payload["logged_out"] = True
             return VoiceResponse(
                 response_text=resp_text,
                 session_id=session_id,
                 requires_confirmation=True,
-                meta={"parsed": out.get("parsed")},
+                meta=meta_payload,
+                logged_out=logout_triggered,
             )
 
         # If agent needs clarification (missing information or auth/login)
@@ -1399,15 +1435,21 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
                 session_manager.save_session(session_id, session)
             
             # Append assistant's clarification question to history
-            session["history"].append({"role": "assistant", "text": clarify_message})
-            session_manager.save_session(session_id, session)
+            if not logout_triggered:
+                session["history"].append({"role": "assistant", "text": clarify_message})
+            if not logout_triggered:
+                session_manager.save_session(session_id, session)
             
             # Return clarification response (no confirmation needed, just asking for more info)
+            meta_payload = {"parsed": out.get("parsed"), "status": "clarify"}
+            if logout_triggered:
+                meta_payload["logged_out"] = True
             return VoiceResponse(
                 response_text=clarify_message,
                 session_id=session_id,
                 requires_confirmation=False,
-                meta={"parsed": out.get("parsed"), "status": "clarify"},
+                meta=meta_payload,
+                logged_out=logout_triggered,
             )
 
         # If auth just completed, persist authenticated user_id into session and hydrate profile
@@ -1443,6 +1485,11 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
         except Exception as e:
             logger.exception("Voice TTS failed: %s", e)
 
+        response_meta: Dict[str, Any] = {}
+        if out.get("tool_result") is not None:
+            response_meta["tool_result"] = out.get("tool_result")
+        if logout_triggered:
+            response_meta["logged_out"] = True
         if not logout_triggered:
             session["history"].append({"role": "assistant", "text": response_text})
             session_manager.save_session(session_id, session)
@@ -1456,7 +1503,7 @@ async def process_voice(request: VoiceRequest, background_tasks: BackgroundTasks
             audio_url=audio_url,
             session_id=session_id,
             requires_confirmation=False,
-            meta={"tool_result": out.get("tool_result")},
+            meta=response_meta or None,
         )
 
     except Exception as e:
@@ -1486,7 +1533,12 @@ async def confirm_action(request: ConfirmRequest):
         session["pending_action"] = None
         deny_text = "Okay, I have cancelled that action."
         session["history"].append({"role": "assistant", "text": deny_text})
-        return VoiceResponse(response_text=deny_text, session_id=session_id, requires_confirmation=False)
+        return VoiceResponse(
+            response_text=deny_text,
+            session_id=session_id,
+            requires_confirmation=False,
+            logged_out=False,
+        )
 
     # User confirmed: re-run orchestration with confirmation flag
     try:
@@ -1518,11 +1570,17 @@ async def confirm_action(request: ConfirmRequest):
             session["history"].append({"role": "assistant", "text": response_text})
             session_manager.save_session(session_id, session)
 
+        meta_payload: Dict[str, Any] = {}
+        if out.get("tool_result") is not None:
+            meta_payload["tool_result"] = out.get("tool_result")
+        if logout_triggered:
+            meta_payload["logged_out"] = True
         return VoiceResponse(
             response_text=response_text,
             session_id=session_id,
             requires_confirmation=False,
-            meta={"tool_result": out.get("tool_result")},
+            meta=meta_payload or None,
+            logged_out=logout_triggered,
         )
     except Exception as e:
         logger.exception("Error confirming action: %s", e)

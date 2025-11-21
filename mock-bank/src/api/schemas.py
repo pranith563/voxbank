@@ -119,3 +119,48 @@ class BeneficiaryCreate(BaseModel):
     bank_name: Optional[str] = None
     is_internal: bool = True
 
+
+class CardOut(BaseModel):
+    card_id: UUID
+    user_id: UUID
+    account_id: Optional[UUID] = None
+    card_number: str
+    card_type: str
+    network: Optional[str] = None
+    last4: str
+    credit_limit: Optional[float] = None
+    current_due: Optional[float] = None
+    min_due: Optional[float] = None
+    due_date: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class LoanOut(BaseModel):
+    loan_id: UUID
+    user_id: UUID
+    loan_type: Optional[str] = None
+    principal_amount: Optional[float] = None
+    outstanding_amount: Optional[float] = None
+    interest_rate: Optional[float] = None
+    emi_amount: Optional[float] = None
+    emi_day_of_month: Optional[int] = None
+    next_due_date: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ReminderOut(BaseModel):
+    reminder_id: UUID
+    user_id: UUID
+    reminder_type: Optional[str] = None
+    title: str
+    description: Optional[str] = None
+    due_date: Optional[str] = None
+    linked_loan_id: Optional[UUID] = None
+    linked_card_id: Optional[UUID] = None
+    status: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

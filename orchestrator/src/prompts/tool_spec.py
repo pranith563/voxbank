@@ -37,6 +37,25 @@ TOOL_SPEC = {
             "account_number": {"type": "string", "required": True}
         }
     },
+    "cards_summary": {
+        "description": "List all cards for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True}
+        }
+    },
+    "loans_summary": {
+        "description": "List loans for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True}
+        }
+    },
+    "reminders_summary": {
+        "description": "List reminders/EMIs for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+            "days": {"type": "integer", "required": False}
+        }
+    },
     "logout_user": {
         "description": "Log out the current session/user and clear assistant state.",
         "params": {}
@@ -142,6 +161,34 @@ TOOL_SPEC_V2 = {
         },
         "examples": [
             {"user_query": "Save John as a beneficiary", "tool_input": {"user_id": "USER_UUID", "nickname": "John", "account_number": "ACC002001"}}
+        ]
+    },
+    "cards_summary": {
+        "description": "List all cards (credit/debit) for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True, "description": "The logged in user's ID."}
+        },
+        "examples": [
+            {"user_query": "What cards do I have?", "tool_input": {"user_id": "USER_UUID"}}
+        ]
+    },
+    "loans_summary": {
+        "description": "List active loans for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True, "description": "The logged in user's ID."}
+        },
+        "examples": [
+            {"user_query": "Show me my loans", "tool_input": {"user_id": "USER_UUID"}}
+        ]
+    },
+    "reminders_summary": {
+        "description": "List reminders (e.g., EMIs, card dues) for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True, "description": "The logged in user's ID."},
+            "days": {"type": "integer", "required": False, "description": "Number of days ahead when requesting upcoming reminders."}
+        },
+        "examples": [
+            {"user_query": "What EMIs are due this month?", "tool_input": {"user_id": "USER_UUID", "days": 30}}
         ]
     },
     "logout_user": {

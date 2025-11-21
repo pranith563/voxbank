@@ -126,6 +126,25 @@ TOOL_METADATA = {
             "user_id": {"type": "string", "required": True},
         },
     },
+    "cards_summary": {
+        "description": "List all cards for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+        },
+    },
+    "loans_summary": {
+        "description": "List active loans for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+        },
+    },
+    "reminders_summary": {
+        "description": "List reminders (optionally upcoming) for the logged-in user.",
+        "params": {
+            "user_id": {"type": "string", "required": True},
+            "days": {"type": "integer", "required": False},
+        },
+    },
     "logout_user": {
         "description": "Log out the current VoxBank user/session.",
         "params": {
@@ -407,6 +426,46 @@ async def get_user_accounts(user_id: str) -> dict:
         }
 
     return {"status": "success", "accounts": result["data"]}
+
+
+@mcp.tool(name="cards_summary", description="List cards for a user")
+async def cards_summary(user_id: str) -> dict:
+    url = _mock_bank_url(f"/api/users/{user_id}/cards")
+    result = await _get_json(url)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+    return {"status": "success", "user_id": user_id, "cards": result["data"]}
+
+
+@mcp.tool(name="loans_summary", description="List loans for a user")
+async def loans_summary(user_id: str) -> dict:
+    url = _mock_bank_url(f"/api/users/{user_id}/loans")
+    result = await _get_json(url)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+    return {"status": "success", "user_id": user_id, "loans": result["data"]}
+
+
+@mcp.tool(name="reminders_summary", description="List reminders for a user")
+async def reminders_summary(user_id: str, days: int = 30) -> dict:
+    params = {"upcoming": "true", "days": days}
+    url = _mock_bank_url(f"/api/users/{user_id}/reminders")
+    result = await _get_json(url, params=params)
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "message": result["message"],
+            "http_status": result.get("status"),
+        }
+    return {"status": "success", "user_id": user_id, "reminders": result["data"], "days": days}
 
 
 @mcp.tool(name="get_user_beneficiaries", description="List beneficiaries for a user")

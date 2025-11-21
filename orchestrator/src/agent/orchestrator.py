@@ -10,9 +10,10 @@ been migrated here. VoxBankAgent is now responsible for LLM decisions,
 while ConversationOrchestrator owns tool execution and loop control.
 """
 
-from typing import Any, Optional, Dict
 import logging
+from typing import Any, Optional, Dict
 
+from otp_manager import OtpManager
 from .agent import VoxBankAgent
 from .helpers import (
     build_user_context_block,
@@ -20,16 +21,22 @@ from .helpers import (
     format_observation_for_history,
 )
 from .normalizer import normalize_input
+from .otp_workflow import OtpWorkflow
 
 
 logger = logging.getLogger("llm_agent")
-
 
 class ConversationOrchestrator:
     def __init__(self, agent: VoxBankAgent, mcp_client: Any, max_iters: int = 4) -> None:
         self.agent = agent
         self.mcp_client = mcp_client
         self.max_iters = max_iters
+        self.otp_manager = OtpManager()
+        self.otp_workflow = OtpWorkflow(
+            agent=self.agent,
+            otp_manager=self.otp_manager,
+            execute_tool_cb=self.execute_tool,
+        )
 
     async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Any:
         """
@@ -76,6 +83,14 @@ class ConversationOrchestrator:
                 session_profile.get("primary_account"),
                 len(session_profile.get("accounts") or []),
             )
+
+        otp_pending_result = await self.otp_workflow.intercept_pending_challenge(
+            session_id=session_id,
+            transcript=transcript,
+            reply_style=reply_style,
+        )
+        if otp_pending_result:
+            return otp_pending_result
 
         auth_state = self.agent._get_auth_state(session_id)
         # If we are currently in a login / registration flow, handle it
@@ -235,7 +250,7 @@ class ConversationOrchestrator:
             # respond -> final reply
             if action == "respond" and assistant_response:
                 logger.info(
-                    "Using LLM-provided response (action=respond) – checking if polishing needed",
+                    "Using LLM-provided response (action=respond) - checking if polishing needed",
                 )
                 should_polish = False  # previously computed but effectively disabled
                 if should_polish:
@@ -257,13 +272,34 @@ class ConversationOrchestrator:
                 else:
                     final_reply = assistant_response
 
+                if not logout_requested:
+                    try:
+                        lower_tx = (transcript or "").lower()
+                        lower_resp = final_reply.lower()
+                        intent_norm = (intent or "").lower() if intent else ""
+                        logout_phrases = (
+                            "logout",
+                            "logged_out",
+                            "logged",
+                            "log out",
+                            "sign out",
+                            "signout",
+                            "log me out",
+                            "log out now",
+                        )
+                        logout_intents = {"logout", "signout", "reset_session"}
+                        if any(p in lower_tx for p in logout_phrases) or any(
+                            p in lower_resp for p in logout_phrases
+                        ) or intent_norm in logout_intents:
+                            logout_requested = True
+                                    
+                    except Exception as e:  # pragma: no cover - defensive logging
+                        logger.exception("Fallback logout_user tool call failed: %s", e)
+
                 self.agent._append_history(session_id, {"role": "assistant", "text": final_reply})
                 logger.info("ORCHESTRATE - Complete (respond)")
-                result = {"status": "ok", "response": final_reply}
-                if logout_requested:
-                    result["logged_out"] = True
+                result = {"status": "ok", "response": final_reply, "logged_out":logout_requested}
                 return result
-
             # call_tool -> gate by auth, resolve accounts, execute tool, loop again
             if action == "call_tool" and requires_tool and tool_name:
                 logger.info("Decision requested tool call: %s (iter %d)", tool_name, iterations)
@@ -272,9 +308,19 @@ class ConversationOrchestrator:
                     if parsed is not None:
                         parsed["tool_input"] = {}
                 if tool_name == "logout_user":
-                    tool_input.setdefault("session_id", session_id)
-                    if session_profile and session_profile.get("user_id"):
-                        tool_input.setdefault("user_id", session_profile.get("user_id"))
+                    result = {"status": "ok", "response": assistant_response, "logged_out":True}
+                    return result
+                user_scoped_tools = {"cards_summary", "loans_summary", "reminders_summary"}
+                if (
+                    tool_name in user_scoped_tools
+                    and session_profile
+                    and session_profile.get("user_id")
+                    and not tool_input.get("user_id")
+                ):
+                    user_id_value = session_profile.get("user_id")
+                    tool_input["user_id"] = user_id_value
+                    if parsed is not None:
+                        parsed.setdefault("tool_input", {})["user_id"] = user_id_value
                 # Gate all non-auth tools behind login/registration.
                 auth_tools = {
                     "register_user",
@@ -348,7 +394,7 @@ class ConversationOrchestrator:
                         }
                         if user_accounts and from_number not in user_accounts:
                             msg = (
-                                "I can’t move money from an account that doesn’t belong to you. "
+                                "I can't move money from an account that doesn't belong to you. "
                                 "Please choose one of your own accounts as the source."
                             )
                             self.agent._append_history(session_id, {"role": "assistant", "text": msg})
@@ -359,6 +405,24 @@ class ConversationOrchestrator:
                             )
                             logger.info("=" * 80)
                             return {"status": "ok", "response": msg}
+
+                        if (
+                            not parse_only
+                            and self.otp_workflow.should_trigger_transfer_otp(
+                                session_id=session_id,
+                                amount_value=tool_input.get("amount"),
+                                session_profile=session_profile,
+                            )
+                        ):
+                            otp_response = await self.otp_workflow.initiate_transfer_otp(
+                                session_id=session_id,
+                                session_profile=session_profile,
+                                tool_name=tool_name,
+                                tool_input=tool_input,
+                                intent=intent,
+                            )
+                            if otp_response:
+                                return otp_response
 
                         tool_input["from_account_number"] = from_number
                         parsed["tool_input"]["from_account_number"] = from_number

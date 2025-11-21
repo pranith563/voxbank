@@ -1,13 +1,14 @@
 from decimal import Decimal
 from typing import List
 from uuid import UUID, uuid4
+from datetime import datetime, timedelta
 import os
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from db.models import Account, Transaction, User
+from db.models import Account, Transaction, User, Card, Loan, Reminder
 from logging_config import get_logger
 from .deps import get_db
 from .schemas import AccountOut, TransactionOut, TransferIn, TransferOut
@@ -16,6 +17,28 @@ from .serializers import serialize_account, serialize_tx
 logger = get_logger("mock_bank.api.accounts")
 
 router = APIRouter(tags=["accounts"])
+
+
+async def _generate_account_number(db) -> str:
+    try:
+        stmt = select(func.count()).select_from(Account)
+        res = await db.execute(stmt)
+        count = res.scalar_one() or 0
+        return f"ACC{count + 1:06d}"
+    except Exception as e:  # pragma: no cover
+        logger.exception("seed_demo: failed to compute account number; using fallback: %s", e)
+        return f"ACC{uuid4().hex[:8].upper()}"
+
+
+async def _generate_card_number(db) -> str:
+    try:
+        stmt = select(func.count()).select_from(Card)
+        res = await db.execute(stmt)
+        count = res.scalar_one() or 0
+        return f"CARD{count + 1:06d}"
+    except Exception as e:  # pragma: no cover
+        logger.exception("seed_demo: failed to compute card number; using fallback: %s", e)
+        return f"CARD{uuid4().hex[:8].upper()}"
 
 
 @router.get("/accounts/{account_number}", response_model=AccountOut)
@@ -279,5 +302,83 @@ async def seed_demo(token: str = Body(..., embed=True), db=Depends(get_db)):
                 db.add(u)
                 created += 1
 
-    logger.info("Admin seed complete; created=%s users", created)
+    async with db.begin():
+        for idx, su in enumerate(sample_users):
+            stmt = sa_select(User).where(User.username == su["username"])
+            res = await db.execute(stmt)
+            user = res.scalars().first()
+            if not user:
+                continue
+
+            acct_stmt = sa_select(Account).where(Account.user_id == user.user_id)
+            account = (await db.execute(acct_stmt)).scalars().first()
+            if not account:
+                acct_number = await _generate_account_number(db)
+                account = Account(
+                    account_id=uuid4(),
+                    account_number=acct_number,
+                    user_id=user.user_id,
+                    account_type="savings",
+                    currency="USD",
+                    balance=Decimal("5000.00") + Decimal(idx * 500),
+                    available_balance=Decimal("5000.00") + Decimal(idx * 500),
+                    status="active",
+                )
+                db.add(account)
+                await db.flush()
+
+            card_stmt = sa_select(Card).where(Card.user_id == user.user_id)
+            card_exists = (await db.execute(card_stmt)).scalars().first()
+            if not card_exists:
+                due_date = datetime.utcnow().date() + timedelta(days=7 + idx)
+                card_number = await _generate_card_number(db)
+                card = Card(
+                    card_id=uuid4(),
+                    user_id=user.user_id,
+                    account_id=getattr(account, "account_id", None),
+                    card_number=card_number,
+                    card_type="credit" if idx % 2 == 0 else "debit",
+                    network="VISA" if idx % 2 == 0 else "MASTERCARD",
+                    last4=card_number[-4:],
+                    credit_limit=Decimal("5000.00") + Decimal(idx * 1000),
+                    current_due=Decimal("150.00") + Decimal(idx * 75),
+                    min_due=Decimal("50.00"),
+                    due_date=due_date,
+                    status="active",
+                )
+                db.add(card)
+
+            loan_stmt = sa_select(Loan).where(Loan.user_id == user.user_id)
+            loan = (await db.execute(loan_stmt)).scalars().first()
+            if not loan:
+                loan = Loan(
+                    loan_id=uuid4(),
+                    user_id=user.user_id,
+                    loan_type="personal_loan" if idx % 2 else "home_loan",
+                    principal_amount=Decimal("20000.00") + Decimal(idx * 5000),
+                    outstanding_amount=Decimal("10000.00") - Decimal(idx * 500),
+                    interest_rate=Decimal("7.50"),
+                    emi_amount=Decimal("450.00") + Decimal(idx * 25),
+                    emi_day_of_month=5 + idx,
+                    next_due_date=datetime.utcnow().date() + timedelta(days=5 + idx * 3),
+                    status="active",
+                )
+                db.add(loan)
+
+            reminder_stmt = sa_select(Reminder).where(Reminder.user_id == user.user_id)
+            reminder_exists = (await db.execute(reminder_stmt)).scalars().first()
+            if not reminder_exists:
+                reminder = Reminder(
+                    reminder_id=uuid4(),
+                    user_id=user.user_id,
+                    reminder_type="emi",
+                    title=f"{su['full_name'].split()[0]}'s EMI",
+                    description="Upcoming EMI payment reminder.",
+                    due_date=datetime.utcnow() + timedelta(days=7 + idx),
+                    linked_loan_id=loan.loan_id if loan else None,
+                    status="pending",
+                )
+                db.add(reminder)
+
+    logger.info("Admin seed complete; created=%s users (cards/loans/reminders ensured)", created)
     return {"seeded_users_created": created}

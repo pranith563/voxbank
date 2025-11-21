@@ -88,3 +88,55 @@ class Beneficiary(Base):
     status = Column(String(20))
     created_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
+
+
+class Card(Base):
+    __tablename__ = "cards"
+
+    card_id = Column(UUID(as_uuid=True), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.account_id"), nullable=True)
+    card_number = Column(String(32), unique=True, nullable=False)
+    card_type = Column(String(20))
+    network = Column(String(20))
+    last4 = Column(String(4))
+    credit_limit = Column(DECIMAL(15, 2))
+    current_due = Column(DECIMAL(15, 2))
+    min_due = Column(DECIMAL(15, 2))
+    due_date = Column(Date)
+    status = Column(String(20))
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class Loan(Base):
+    __tablename__ = "loans"
+
+    loan_id = Column(UUID(as_uuid=True), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    loan_type = Column(String(50))
+    principal_amount = Column(DECIMAL(15, 2))
+    outstanding_amount = Column(DECIMAL(15, 2))
+    interest_rate = Column(DECIMAL(5, 2))
+    emi_amount = Column(DECIMAL(15, 2))
+    emi_day_of_month = Column(Integer)
+    next_due_date = Column(Date)
+    status = Column(String(20))
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    reminder_id = Column(UUID(as_uuid=True), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
+    reminder_type = Column(String(20))
+    title = Column(String(255))
+    description = Column(String)
+    due_date = Column(TIMESTAMP)
+    linked_loan_id = Column(UUID(as_uuid=True), ForeignKey("loans.loan_id"), nullable=True)
+    linked_card_id = Column(UUID(as_uuid=True), ForeignKey("cards.card_id"), nullable=True)
+    status = Column(String(20))
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)

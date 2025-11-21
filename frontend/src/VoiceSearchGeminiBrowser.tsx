@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 /* ----- Types for SpeechRecognition (TS) ----- */
 declare global {
@@ -21,12 +21,14 @@ interface Props {
   language?: string;
   voiceType?: string;
   sessionId: string;
+  onForceLogout?: () => void;
 }
 
 export default function VoiceSearchGeminiBrowser({
   language = "en-US",
   voiceType = "default",
   sessionId,
+  onForceLogout,
 }: Props): JSX.Element {
   // UI / recognition states
   const [listening, setListening] = useState(false);
@@ -55,6 +57,12 @@ export default function VoiceSearchGeminiBrowser({
   const [agentMode, setAgentMode] = useState<AgentMode>("idle");
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+
+  const triggerForceLogout = useCallback(() => {
+    if (onForceLogout) {
+      onForceLogout();
+    }
+  }, [onForceLogout]);
 
   // ---------- lifecycle ----------
   useEffect(() => {
@@ -203,6 +211,12 @@ export default function VoiceSearchGeminiBrowser({
           return;
         }
 
+        if (parsed && parsed.type === "logout") {
+          console.log("[WS] logout event received");
+          triggerForceLogout();
+          return;
+        }
+
         if (parsed && parsed.type === "reply" && parsed.text) {
           console.log("[WS] reply text:", parsed.text);
           setChatMessages((prev) => [...prev, { role: "assistant", text: parsed.text }]);
@@ -210,6 +224,9 @@ export default function VoiceSearchGeminiBrowser({
             // Browser TTS mode
             setAgentMode("speaking");
             speak(parsed.text);
+          }
+          if (parsed.logged_out) {
+            triggerForceLogout();
           }
           return;
         }
