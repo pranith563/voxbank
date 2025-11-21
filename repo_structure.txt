@@ -15,7 +15,7 @@ voxbank/
 ├── orchestrator/                 # LLM Orchestration + Conversation Engine
 │   ├── src/
 │   │   ├── app.py (FastAPI)
-│   │   ├── llm_agent.py
+│   │   ├── agent.py
 │   │   ├── nlu/
 │   │   │   ├── intent_classifier.py
 │   │   │   └── entity_resolver.py

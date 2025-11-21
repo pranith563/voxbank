@@ -12,7 +12,7 @@ from decimal import Decimal
 import logging
 
 
-logger = logging.getLogger("llm_agent.helpers")
+logger = logging.getLogger("agent.helpers")
 
 
 def format_amount(value: Any, currency: str = "USD") -> Optional[str]:

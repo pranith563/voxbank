@@ -24,7 +24,7 @@ from .normalizer import normalize_input
 from .otp_workflow import OtpWorkflow
 
 
-logger = logging.getLogger("llm_agent")
+logger = logging.getLogger("agent")
 
 class ConversationOrchestrator:
     def __init__(self, agent: VoxBankAgent, mcp_client: Any, max_iters: int = 4) -> None:

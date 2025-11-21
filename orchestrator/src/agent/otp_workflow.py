@@ -11,7 +11,7 @@ from otp_manager import OtpManager
 from .agent import VoxBankAgent
 from .helpers import format_observation_for_history
 
-logger = logging.getLogger("llm_agent")
+logger = logging.getLogger("agent")
 
 OTP_SMS_API_KEY = os.getenv("OTP_SMS_API_KEY")
 OTP_SMS_BASE_URL = os.getenv("OTP_SMS_BASE_URL", "https://2factor.in/API/V1")

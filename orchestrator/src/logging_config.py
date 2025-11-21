@@ -15,7 +15,7 @@ LOG_DIR.mkdir(exist_ok=True)
 
 # Log file paths
 APP_LOG_FILE = LOG_DIR / "app.log"
-LLM_AGENT_LOG_FILE = LOG_DIR / "llm_agent.log"
+AGENT_LOG_FILE = LOG_DIR / "agent.log"
 MCP_CLIENT_LOG_FILE = LOG_DIR / "mcp_client.log"
 GEMINI_CLIENT_LOG_FILE = LOG_DIR / "gemini_client.log"
 
@@ -76,7 +76,7 @@ def setup_logging():
     
     # Set up module-specific loggers
     setup_file_logger("voxbank.orchestrator", APP_LOG_FILE, level)
-    setup_file_logger("llm_agent", LLM_AGENT_LOG_FILE, level)
+    setup_file_logger("agent", AGENT_LOG_FILE, level)
     setup_file_logger("voxbank.mcp_client", MCP_CLIENT_LOG_FILE, level)
     setup_file_logger("gemini_llm_client", GEMINI_CLIENT_LOG_FILE, level)
     

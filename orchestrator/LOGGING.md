@@ -9,7 +9,7 @@ The orchestrator uses file-based logging with separate log files for different m
 All log files are stored in `orchestrator/logs/` directory:
 
 - **`app.log`** - FastAPI application logs (API requests, endpoints, startup/shutdown)
-- **`llm_agent.log`** - LLM agent orchestration logs (intent parsing, tool calls, LLM interactions)
+- **`agent.log`** - LLM agent orchestration logs (intent parsing, tool calls, LLM interactions)
 - **`mcp_client.log`** - MCP client logs (tool execution, MCP server communication)
 - **`gemini_client.log`** - Gemini LLM client logs (API calls, responses)
 
@@ -43,7 +43,7 @@ export LOG_LEVEL=DEBUG
 - Startup and shutdown events
 - Error details with full context
 
-### llm_agent.py
+### agent.py
 - LLM decision-making process (`_llm_act_decision`)
 - Full prompts sent to LLM
 - LLM raw responses
@@ -87,18 +87,18 @@ ORCHESTRATE - Complete
 
 ```
 2025-01-XX 10:00:00 - voxbank.orchestrator - INFO - API Request: POST /api/text/process
-2025-01-XX 10:00:00 - llm_agent - INFO - ORCHESTRATE - Starting
-2025-01-XX 10:00:00 - llm_agent - INFO - LLM ACT DECISION - Starting
-2025-01-XX 10:00:00 - llm_agent - INFO - Calling LLM with prompt (length: 1234 chars)
-2025-01-XX 10:00:01 - llm_agent - INFO - LLM raw response received (length: 456 chars)
-2025-01-XX 10:00:01 - llm_agent - INFO - LLM Decision: action=call_tool, intent=balance, tool_name=balance
-2025-01-XX 10:00:01 - llm_agent - INFO - EXECUTING MCP TOOL
-2025-01-XX 10:00:01 - llm_agent - INFO - Tool: balance
-2025-01-XX 10:00:01 - llm_agent - INFO - Input: {'account_number': 'primary'}
-2025-01-XX 10:00:01 - llm_agent - INFO - MCP TOOL RESULT
-2025-01-XX 10:00:01 - llm_agent - INFO - Result: {'status': 'success', 'balance': 1000.0}
-2025-01-XX 10:00:01 - llm_agent - INFO - Generated response: Your account balance is 1000.0 USD.
-2025-01-XX 10:00:01 - llm_agent - INFO - ORCHESTRATE - Complete
+2025-01-XX 10:00:00 - agent - INFO - ORCHESTRATE - Starting
+2025-01-XX 10:00:00 - agent - INFO - LLM ACT DECISION - Starting
+2025-01-XX 10:00:00 - agent - INFO - Calling LLM with prompt (length: 1234 chars)
+2025-01-XX 10:00:01 - agent - INFO - LLM raw response received (length: 456 chars)
+2025-01-XX 10:00:01 - agent - INFO - LLM Decision: action=call_tool, intent=balance, tool_name=balance
+2025-01-XX 10:00:01 - agent - INFO - EXECUTING MCP TOOL
+2025-01-XX 10:00:01 - agent - INFO - Tool: balance
+2025-01-XX 10:00:01 - agent - INFO - Input: {'account_number': 'primary'}
+2025-01-XX 10:00:01 - agent - INFO - MCP TOOL RESULT
+2025-01-XX 10:00:01 - agent - INFO - Result: {'status': 'success', 'balance': 1000.0}
+2025-01-XX 10:00:01 - agent - INFO - Generated response: Your account balance is 1000.0 USD.
+2025-01-XX 10:00:01 - agent - INFO - ORCHESTRATE - Complete
 ```
 
 ## Console Output

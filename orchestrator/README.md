@@ -4,7 +4,7 @@ The orchestrator is a FastAPI service that hosts VoxBank’s LLM-based assistant
 
 ## Overview
 
-- **LLMAgent (`orchestrator/src/llm_agent.py`)**
+- **LLMAgent (`orchestrator/src/agent.py`)**
   - ReAct loop: decides `respond` / `call_tool` / `ask_user` / `ask_confirmation`.
   - Uses a Gemini-based `GeminiLLMClient` for both decision and final reply polishing.
   - Maintains per-session conversation history and a small auth state.

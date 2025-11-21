@@ -15,7 +15,7 @@ import logging
 from guards.json_clean import validate_ai_json
 
 
-logger = logging.getLogger("llm_agent.normalizer")
+logger = logging.getLogger("agent.normalizer")
 
 
 async def normalize_input(

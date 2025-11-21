@@ -49,7 +49,7 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 VOX_BANK_BASE_URL = os.environ.get("VOX_BANK_BASE_URL", "http://localhost:9000")
 
 
-logger = logging.getLogger("llm_agent")
+logger = logging.getLogger("agent")
 
 
 class VoxBankAgent:
