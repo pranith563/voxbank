@@ -126,22 +126,30 @@ TOOL_METADATA = {
             "user_id": {"type": "string", "required": True},
         },
     },
+    # Simple \"my_*\" info tools that do not require user_id in tool_input.
+    "get_my_profile": {
+        "description": "Get the current logged-in user's profile.",
+        "params": {},
+    },
+    "get_my_accounts": {
+        "description": "Get the current logged-in user's accounts.",
+        "params": {},
+    },
+    "get_my_beneficiaries": {
+        "description": "Get the current logged-in user's saved payees/beneficiaries.",
+        "params": {},
+    },
     "cards_summary": {
-        "description": "List all cards for the logged-in user.",
-        "params": {
-            "user_id": {"type": "string", "required": True},
-        },
+        "description": "List all cards for the current logged-in user.",
+        "params": {},
     },
     "loans_summary": {
-        "description": "List active loans for the logged-in user.",
-        "params": {
-            "user_id": {"type": "string", "required": True},
-        },
+        "description": "List active loans for the current logged-in user.",
+        "params": {},
     },
     "reminders_summary": {
-        "description": "List reminders (optionally upcoming) for the logged-in user.",
+        "description": "List reminders (optionally upcoming) for the current logged-in user.",
         "params": {
-            "user_id": {"type": "string", "required": True},
             "days": {"type": "integer", "required": False},
         },
     },
@@ -411,6 +419,25 @@ async def get_user_profile(user_id: str) -> dict:
     return {"status": "success", "user": result["data"]}
 
 
+# ---------------------------------------------------------------------------
+# \"My\" info tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(name="get_my_profile", description="Get the current logged-in user's profile")
+async def get_my_profile(user_id: str | None = None, session_id: str | None = None) -> dict:  # noqa: ARG001
+    """
+    Resolve the current user's profile without exposing user_id in tool_input
+    to the LLM. The orchestrator MUST inject user_id/session_id as hidden params.
+    """
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for get_my_profile.",
+        }
+    return await get_user_profile(user_id)
+
+
 @mcp.tool(name="get_user_accounts", description="Fetch all accounts for a user by user_id")
 async def get_user_accounts(user_id: str) -> dict:
     """
@@ -428,8 +455,23 @@ async def get_user_accounts(user_id: str) -> dict:
     return {"status": "success", "accounts": result["data"]}
 
 
-@mcp.tool(name="cards_summary", description="List cards for a user")
-async def cards_summary(user_id: str) -> dict:
+@mcp.tool(name="get_my_accounts", description="Get the current logged-in user's accounts")
+async def get_my_accounts(user_id: str | None = None, session_id: str | None = None) -> dict:  # noqa: ARG001
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for get_my_accounts.",
+        }
+    return await get_user_accounts(user_id)
+
+
+@mcp.tool(name="cards_summary", description="List cards for the current user")
+async def cards_summary(user_id: str | None = None, session_id: str | None = None) -> dict:  # noqa: ARG001
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for cards_summary.",
+        }
     url = _mock_bank_url(f"/api/users/{user_id}/cards")
     result = await _get_json(url)
     if not result["ok"]:
@@ -438,11 +480,20 @@ async def cards_summary(user_id: str) -> dict:
             "message": result["message"],
             "http_status": result.get("status"),
         }
-    return {"status": "success", "user_id": user_id, "cards": result["data"]}
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "cards": result["data"],
+    }
 
 
-@mcp.tool(name="loans_summary", description="List loans for a user")
-async def loans_summary(user_id: str) -> dict:
+@mcp.tool(name="loans_summary", description="List loans for the current user")
+async def loans_summary(user_id: str | None = None, session_id: str | None = None) -> dict:  # noqa: ARG001
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for loans_summary.",
+        }
     url = _mock_bank_url(f"/api/users/{user_id}/loans")
     result = await _get_json(url)
     if not result["ok"]:
@@ -451,11 +502,24 @@ async def loans_summary(user_id: str) -> dict:
             "message": result["message"],
             "http_status": result.get("status"),
         }
-    return {"status": "success", "user_id": user_id, "loans": result["data"]}
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "loans": result["data"],
+    }
 
 
-@mcp.tool(name="reminders_summary", description="List reminders for a user")
-async def reminders_summary(user_id: str, days: int = 30) -> dict:
+@mcp.tool(name="reminders_summary", description="List reminders for the current user")
+async def reminders_summary(
+    days: int = 30,
+    user_id: str | None = None,
+    session_id: str | None = None,  # noqa: ARG001
+) -> dict:
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for reminders_summary.",
+        }
     params = {"upcoming": "true", "days": days}
     url = _mock_bank_url(f"/api/users/{user_id}/reminders")
     result = await _get_json(url, params=params)
@@ -465,7 +529,27 @@ async def reminders_summary(user_id: str, days: int = 30) -> dict:
             "message": result["message"],
             "http_status": result.get("status"),
         }
-    return {"status": "success", "user_id": user_id, "reminders": result["data"], "days": days}
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "reminders": result["data"],
+        "days": days,
+    }
+
+
+@mcp.tool(name="get_my_beneficiaries", description="List beneficiaries for the current user")
+async def get_my_beneficiaries(
+    limit: int = 50,
+    offset: int = 0,
+    user_id: str | None = None,
+    session_id: str | None = None,  # noqa: ARG001
+) -> dict:
+    if not user_id:
+        return {
+            "status": "error",
+            "message": "No user context available for get_my_beneficiaries.",
+        }
+    return await get_user_beneficiaries(user_id=user_id, limit=limit, offset=offset)
 
 
 @mcp.tool(name="get_user_beneficiaries", description="List beneficiaries for a user")

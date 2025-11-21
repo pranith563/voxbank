@@ -23,11 +23,17 @@ TOOL_SPEC = {
             "reference": {"type": "string", "required": False}
         }
     },
-    "get_user_beneficiaries": {
-        "description": "List all beneficiaries (saved payees) for the currently logged-in user.",
-        "params": {
-            "user_id": {"type": "string", "required": True}
-        }
+    "get_my_profile": {
+        "description": "Get the current logged-in user's profile.",
+        "params": {}
+    },
+    "get_my_accounts": {
+        "description": "Get the current logged-in user's accounts.",
+        "params": {}
+    },
+    "get_my_beneficiaries": {
+        "description": "Get the current logged-in user's saved payees/beneficiaries.",
+        "params": {}
     },
     "add_beneficiary": {
         "description": "Add a new beneficiary (saved payee) for the logged-in user.",
@@ -39,20 +45,15 @@ TOOL_SPEC = {
     },
     "cards_summary": {
         "description": "List all cards for the logged-in user.",
-        "params": {
-            "user_id": {"type": "string", "required": True}
-        }
+        "params": {}
     },
     "loans_summary": {
         "description": "List loans for the logged-in user.",
-        "params": {
-            "user_id": {"type": "string", "required": True}
-        }
+        "params": {}
     },
     "reminders_summary": {
         "description": "List reminders/EMIs for the logged-in user.",
         "params": {
-            "user_id": {"type": "string", "required": True},
             "days": {"type": "integer", "required": False}
         }
     },
@@ -127,17 +128,28 @@ TOOL_SPEC_V2 = {
             {"user_query": "transfer 1000 INR to ACC98765", "tool_input": {"from_account_number": "ACC08765", "to_account_number": "ACC98765", "amount": 1000, "currency": "INR"}}
         ]
     },
-    "get_user_beneficiaries": {
-        "description": "List all beneficiaries (saved payees) for a logged-in user.",
-        "params": {
-            "user_id": {
-                "type": "string",
-                "required": True,
-                "description": "The logged in user's ID."
-            }
-        },
+    "get_my_profile": {
+        "description": "Get the current logged-in user's profile (name, username, phone, language, default currency).",
+        "params": {},
         "examples": [
-            {"user_query": "Who have I saved as payees?", "tool_input": {"user_id": "USER_UUID"}}
+            {"user_query": "Show my profile", "tool_input": {}},
+            {"user_query": "What phone number is registered?", "tool_input": {}}
+        ]
+    },
+    "get_my_accounts": {
+        "description": "Get the list of the current user's bank accounts (numbers, types, currencies).",
+        "params": {},
+        "examples": [
+            {"user_query": "What accounts do I have?", "tool_input": {}},
+            {"user_query": "List all my accounts", "tool_input": {}}
+        ]
+    },
+    "get_my_beneficiaries": {
+        "description": "List all beneficiaries (saved payees) for the current logged-in user.",
+        "params": {},
+        "examples": [
+            {"user_query": "Who have I saved as payees?", "tool_input": {}},
+            {"user_query": "Show my saved beneficiaries", "tool_input": {}}
         ]
     },
     "add_beneficiary": {

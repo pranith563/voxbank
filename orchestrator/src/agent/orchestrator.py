@@ -17,15 +17,15 @@ from otp_manager import OtpManager
 from .agent import VoxBankAgent
 from .helpers import (
     build_user_context_block,
-    format_observation_for_history,
     render_history_for_prompt,
-    resolve_account_from_profile,
 )
 from .normalizer import normalize_input
 from .otp_workflow import OtpWorkflow
+from prompts.tool_spec import TOOL_SPEC
 
 
 logger = logging.getLogger("agent")
+
 
 class ConversationOrchestrator:
     def __init__(self, agent: VoxBankAgent, mcp_client: Any, max_iters: int = 10) -> None:
@@ -438,6 +438,32 @@ class ConversationOrchestrator:
         if otp_response is not None:
             return otp_response, None, False
 
+        # Validate required parameters before executing any tool.
+        valid, missing = self._validate_tool_input(tool_name, tool_input)
+        if not valid:
+            tool_result = {
+                "status": "error",
+                "tool_error": "missing_required_params",
+                "tool_name": tool_name,
+                "missing_params": missing,
+                "partial_input": tool_input or {},
+            }
+            summary = (
+                f"Tool {tool_name} call rejected: missing required params: "
+                f"{', '.join(missing)}. The assistant should obtain these values "
+                "before retrying the tool."
+            )
+            self.agent._append_history(
+                session_id,
+                {"role": "tool", "text": summary, "detail": tool_result},
+            )
+            logger.info(
+                "ORCHESTRATE - Tool %s missing required params %s; appended tool error to history",
+                tool_name,
+                missing,
+            )
+            return None, tool_result, False
+
         if requires_confirmation and not user_confirmation:
             confirm_response = self._build_confirmation_response(
                 session_id=session_id,
@@ -447,7 +473,29 @@ class ConversationOrchestrator:
             )
             return confirm_response, None, False
 
-        tool_result = await self._execute_tool_safe(tool_name, tool_input)
+        tool_result = await self._execute_tool_safe(
+            tool_name,
+            tool_input,
+            session_id=session_id,
+            session_profile=session_profile,
+        )
+
+        # If a \"my_*\" or summary tool reports missing user context despite
+        # reaching this point, surface a friendly login/register prompt.
+        if (
+            isinstance(tool_result, dict)
+            and tool_result.get("status") == "error"
+            and isinstance(tool_result.get("message"), str)
+            and "No user context available" in tool_result.get("message", "")
+        ):
+            msg = "You're not logged in yet. Would you like to login or register?"
+            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+            logger.info(
+                "ORCHESTRATE - Tool %s reported missing user context; prompting login/register",
+                tool_name,
+            )
+            logger.info("=" * 80)
+            return {"status": "clarify", "message": msg}, None, False
 
         return None, tool_result, False
 
@@ -534,16 +582,58 @@ class ConversationOrchestrator:
         self,
         tool_name: str,
         tool_input: Dict[str, Any],
-    ) -> tuple[Any, Dict[str, Any]]:
+        *,
+        session_id: str,
+        session_profile: Optional[Dict[str, Any]],
+    ) -> Any:
         if not self.mcp_client:
             logger.error("MCP client not configured - cannot execute tool")
-            return None, {"status": "not_configured", "message": "MCP client not set up."}
+            return None
+
+        payload: Dict[str, Any] = dict(tool_input or {})
+        if tool_name in {
+            "get_my_profile",
+            "get_my_accounts",
+            "get_my_beneficiaries",
+            "cards_summary",
+            "loans_summary",
+            "reminders_summary",
+            "logout_user",
+        }:
+            if session_profile and session_profile.get("user_id"):
+                payload.setdefault("user_id", str(session_profile.get("user_id")))
+            payload.setdefault("session_id", session_id)
 
         try:
-            logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, tool_input)
-            tool_result = await self.execute_tool(tool_name, tool_input)
+            logger.info("EXECUTING MCP TOOL %s with input %s", tool_name, payload)
+            tool_result = await self.execute_tool(tool_name, payload)
             logger.info("Tool result: %s", tool_result)
             return tool_result
         except Exception as exc:
             logger.exception("Exception while executing tool %s: %s", tool_name, exc)
             return None
+
+    def _validate_tool_input(
+        self,
+        tool_name: str,
+        tool_input: Any,
+    ) -> tuple[bool, list[str]]:
+        """
+        Validate tool_input against TOOL_SPEC to ensure all required params
+        are present before executing the tool.
+        """
+        spec = TOOL_SPEC.get(tool_name) or {}
+        params_meta = spec.get("params") or {}
+        required_params = [
+            name for name, meta in params_meta.items() if (meta or {}).get("required")
+        ]
+        if not required_params:
+            return True, []
+
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        missing = [
+            name
+            for name in required_params
+            if name not in payload or payload.get(name) in (None, "")
+        ]
+        return (len(missing) == 0, missing)
