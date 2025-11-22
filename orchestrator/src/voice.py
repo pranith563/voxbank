@@ -6,8 +6,8 @@ import struct
 from google import genai
 from google.genai import types
 
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
 api_key=os.environ.get("GEMINI_API_KEY")
 print(api_key)

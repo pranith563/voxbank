@@ -11,7 +11,7 @@ This module wires together:
 
 import os
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -22,8 +22,8 @@ from logging_config import get_logger, setup_logging
 from api.accounts import router as accounts_router
 from api.users import router as users_router
 
-# Load environment variables early
-load_dotenv()
+# Load environment variables early (shared root .env)
+load_dotenv(find_dotenv(), override=False)
 
 # Configure logging before creating the app
 setup_logging()
@@ -92,4 +92,3 @@ async def on_shutdown():
     except Exception:
         logger.exception("Error disposing engine on shutdown")
     logger.info("Mock-bank shutting down")
-

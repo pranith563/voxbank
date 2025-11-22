@@ -1,5 +1,5 @@
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 # voiceConversion.py
 """
 FastAPI WebSocket service that accepts {"type":"transcript","text":"..."} and replies

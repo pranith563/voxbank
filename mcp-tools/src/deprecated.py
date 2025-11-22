@@ -9,14 +9,14 @@ MCP Tools adapter (FastAPI + FastMCP)
 import os
 import logging
 from typing import Optional, Dict, Any, List
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Header, HTTPException, status, Depends, Request
 import httpx
 import asyncio
 import uuid
 
-load_dotenv()
+load_dotenv(find_dotenv(), override=False)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MCP_TOOL_KEY = os.getenv("MCP_TOOL_KEY", "mcp-test-key")

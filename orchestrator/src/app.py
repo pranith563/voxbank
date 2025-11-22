@@ -9,14 +9,14 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import os
 import logging
 import asyncio
 import httpx
 import json
 # Load environment
-load_dotenv()
+load_dotenv(find_dotenv(), override=False)
 
 # Set up file-based logging
 from logging_config import setup_logging, get_logger

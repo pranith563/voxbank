@@ -23,12 +23,12 @@ import logging
 import os
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from fastmcp import FastMCP
 
 from logging_config import get_logger, setup_logging
 
-load_dotenv()
+load_dotenv(find_dotenv(), override=False)
 
 VOX_BANK_BASE = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")

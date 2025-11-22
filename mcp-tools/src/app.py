@@ -10,13 +10,13 @@ from fastapi import FastAPI, Header, HTTPException, Request, status, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import logging
 import httpx
 import asyncio
 import uuid
 
-load_dotenv()
+load_dotenv(find_dotenv(), override=False)
 
 MCP_TOOL_KEY = os.getenv("MCP_TOOL_KEY", "mcp-test-key")          # shared secret between orchestrator and MCP tools
 MOCK_BANK_BASE = os.getenv("MOCK_BANK_BASE_URL", "http://localhost:9000")
