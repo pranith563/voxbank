@@ -35,8 +35,10 @@ from voice_processing import (
     synthesize_text_to_audio,
     audio_bytes_to_data_url,
     extract_voice_embedding,
+    initialize_tts_backends,
 )
 from agent.helpers import translate_text
+from context.voice_profile import merge_voice_profile, get_voice_profile
 
 VOX_BANK_BASE_URL = os.getenv("VOX_BANK_BASE_URL", "http://localhost:9000")
 
@@ -490,6 +492,13 @@ async def startup_event():
     app.state.mcp_client = MCPClient(base_url=os.getenv("MCP_TOOL_BASE_URL"))
     app.state.session_manager = session_manager
 
+    # Warm up TTS backends so first request doesn't pay cold-start cost
+    try:
+        tts_status = await initialize_tts_backends()
+        logger.info("TTS backends initialized: %s", tts_status)
+    except Exception as exc:
+        logger.exception("Failed to initialize TTS backends: %s", exc)
+
     # Initialize MCP client (discovery / open transport)
     tool_spec: Dict[str, Any] = {}
     try:
@@ -817,6 +826,9 @@ async def websocket_chat(ws: WebSocket):
 
                 # Ensure session exists and append history entry
                 session = session_manager.ensure_session(session_id, user_id=None)
+                if isinstance(data.get("voice_profile"), dict):
+                    session["voice_profile"] = merge_voice_profile(data["voice_profile"])
+                    session_manager.save_session(session_id, session)
                 _apply_language_settings(
                     session,
                     session_id,
@@ -830,6 +842,8 @@ async def websocket_chat(ws: WebSocket):
                     agent: VoxBankAgent = app.state.agent
                     logger.info("WS: calling agent.orchestrate() for session %s", session_id)
                     profile = get_session_profile(session_id)
+                    voice_profile = get_voice_profile(profile)
+                    reply_style = voice_profile.get("style", "warm")
                     user_lang = (profile.get("preferred_language") or "en").lower()
                     logger.info("WS: preferred_language=%s", user_lang)
                     effective_transcript = transcript
@@ -880,7 +894,11 @@ async def websocket_chat(ws: WebSocket):
                     # Optionally generate server-side TTS audio for this reply
                     if output_audio and response_text:
                         try:
-                            audio_bytes = await synthesize_text_to_audio(response_text)
+                            audio_bytes = await synthesize_text_to_audio(
+                                response_text,
+                                session_profile=profile,
+                                reply_style=reply_style,
+                            )
                             if audio_bytes:
                                 audio_url = audio_bytes_to_data_url(audio_bytes, mime="audio/wav")
                                 await ws.send_text(
@@ -890,6 +908,7 @@ async def websocket_chat(ws: WebSocket):
                                             "audio": audio_url,
                                             "mime": "audio/wav",
                                             "session_id": session_id,
+                                            "voice_profile": voice_profile,
                                         }
                                     )
                                 )

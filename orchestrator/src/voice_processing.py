@@ -12,7 +12,7 @@ All implementations are currently stubbed/minimal and should be replaced
 with real engines (e.g. local ASR, cloud TTS, or embedding models) later.
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any
 import base64
 import logging
 import os
@@ -20,6 +20,11 @@ import asyncio
 import time
 from io import BytesIO
 import wave
+import tempfile
+import subprocess
+import shutil
+
+from context.voice_profile import get_voice_profile
 
 logger = logging.getLogger("voxbank.voice_processing")
 
@@ -61,6 +66,7 @@ _gemini_client = None
 _genai_types = None
 _local_tts_model = None
 _local_vocoder = None
+_tts_initialized = False
 
 
 async def transcribe_audio_to_text(audio_bytes: bytes, *, lang: str = "en") -> str:
@@ -85,53 +91,57 @@ async def transcribe_audio_to_text(audio_bytes: bytes, *, lang: str = "en") -> s
   return ""
 
 
-async def synthesize_text_to_audio(text: str, *, lang: str = "en") -> Optional[bytes]:
+async def synthesize_text_to_audio(
+  text: str,
+  *,
+  session_profile: Optional[Dict[str, Any]] = None,
+  reply_style: str = "warm",
+  lang: str = "en",
+) -> Optional[bytes]:
   """
   Text-to-speech implementation using the configured backend.
 
   - Input: assistant reply text.
   - Output: audio bytes or None if TTS is not configured/available.
 
-  Backend is selected via TTS_PROVIDER env var:
-    - "openai" (default): OpenAI gpt-4o-mini-tts
-    - "gemini": Gemini gemini-2.5-flash-lite-preview-tts
+  Backend is selected via session voice_profile engine with fallback to cloud:
+    - "speechbrain" (default local)
+    - "piper" (local CLI/binding)
+    - "openai" (cloud)
+    - "gemini" (cloud)
   """
   if not text:
     return None
 
-  requested_provider = (TTS_PROVIDER or "openai").lower()
-  provider_used = None
+  profile = get_voice_profile(session_profile)
+  engine = (profile.get("engine") or "speechbrain").lower()
+  voice_id = profile.get("voice_id") or "en_IN_female1"
+  style = profile.get("style") or reply_style
+
+  provider_used = engine
   audio: Optional[bytes] = None
   started = time.perf_counter()
 
-  # Try Gemini first if requested
-  if requested_provider == "gemini":
-    provider_used = "gemini"
-    audio = await _synthesize_with_gemini(text, lang=lang)
-    if audio is None:
-      logger.warning(
-        "TTS: Gemini backend failed or not configured; will fall back to other providers"
-      )
-
-  # Try local SpeechBrain TTS if explicitly requested or Gemini failed
-  if audio is None and requested_provider in {"local", "speechbrain"}:
-    provider_used = "local"
+  # Local-first
+  if engine == "piper":
+    audio = await _synthesize_with_piper(text, voice_id=voice_id, style=style)
+  elif engine in {"speechbrain", "local"}:
     audio = await _synthesize_with_local(text, lang=lang)
-    if audio is None:
-      logger.warning(
-        "TTS: Local (SpeechBrain) backend failed or not configured; will fall back to OpenAI if available"
-      )
-
-  # Fallback or default: OpenAI
-  if audio is None:
-    provider_used = "openai"
+  elif engine == "gemini":
+    audio = await _synthesize_with_gemini(text, lang=lang)
+  elif engine == "openai":
     audio = await _synthesize_with_openai(text, lang=lang)
+
+  # Fallback to cloud if local failed or unsupported engine
+  if audio is None:
+    provider_used = "cloud_fallback"
+    audio = await _synthesize_with_cloud_tts(text, voice_id=voice_id, style=style, lang=lang)
 
   elapsed_ms = (time.perf_counter() - started) * 1000.0
   logger.info(
-    "TTS: provider=%s requested=%s duration_ms=%.1f success=%s bytes=%s",
+    "TTS: provider=%s engine=%s duration_ms=%.1f success=%s bytes=%s",
     provider_used,
-    requested_provider,
+    engine,
     elapsed_ms,
     bool(audio),
     len(audio) if audio else 0,
@@ -394,6 +404,79 @@ async def _synthesize_with_local(text: str, *, lang: str = "en") -> Optional[byt
     return None
 
 
+async def _synthesize_with_piper(text: str, *, voice_id: str, style: str = "warm") -> Optional[bytes]:
+  """
+  Piper CLI/binding helper. Uses subprocess if available.
+  """
+  piper_exe = shutil.which("piper")
+  if not piper_exe:
+    logger.warning("TTS(Piper): 'piper' executable not found in PATH; skipping")
+    return None
+
+  # Piper expects a voice model file; callers should supply a model path in voice_id.
+  # We use a blocking subprocess executed in a worker thread for Windows compatibility.
+  if not voice_id:
+    logger.warning("TTS(Piper): no voice_id provided")
+    return None
+
+  async def _run_piper() -> Optional[bytes]:
+    try:
+      with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, "piper_out.wav")
+        cmd = [piper_exe, "-m", voice_id, "-f", out_path]
+        logger.info("TTS(Piper): invoking %s", cmd)
+        try:
+          result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+          )
+        except FileNotFoundError:
+          logger.warning("TTS(Piper): voice model file not found for voice_id=%s", voice_id)
+          return None
+
+        if result.returncode != 0:
+          logger.warning("TTS(Piper): command failed with code %s", result.returncode)
+          return None
+        if not os.path.exists(out_path):
+          logger.warning("TTS(Piper): output file not found after synthesis")
+          return None
+        with open(out_path, "rb") as f:
+          audio_bytes = f.read()
+        logger.info("TTS(Piper): produced %d bytes using model=%s", len(audio_bytes), voice_id)
+        return audio_bytes
+    except Exception as exc:  # pragma: no cover - external dependency
+      logger.exception("TTS(Piper): synthesis failed: %s", exc)
+      return None
+
+  return await _run_piper()
+
+
+async def _synthesize_with_cloud_tts(
+  text: str,
+  *,
+  voice_id: Optional[str],
+  style: str,
+  lang: str = "en",
+) -> Optional[bytes]:
+  """
+  Thin wrapper to reuse OpenAI/Gemini helpers as cloud fallback.
+  """
+  requested = (TTS_PROVIDER or "openai").lower()
+  audio = None
+  if requested == "gemini":
+    audio = await _synthesize_with_gemini(text, lang=lang)
+  if audio is None and requested in {"openai", "speechbrain", "local", "piper"}:
+    audio = await _synthesize_with_openai(text, lang=lang)
+  if audio is None and requested != "gemini":
+    # final fallback to Gemini if configured provider failed and GEMINI key exists
+    audio = await _synthesize_with_gemini(text, lang=lang)
+  return audio
+
+
 def _guess_audio_mime(audio_bytes: bytes, default: str = "audio/wav") -> str:
   """
   Best-effort MIME detection for common audio formats.
@@ -455,3 +538,115 @@ async def extract_voice_embedding(audio_bytes: bytes) -> Optional[list[float]]:
   # Real implementation should call a speaker embedding model.
   length = float(len(audio_bytes))
   return [length, 0.0, 0.0]
+
+
+# ---------------------------------------------------------------------------
+# Initialization helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_openai_client() -> bool:
+  global _openai_client
+  if _openai_client is not None:
+    return True
+  if not OPENAI_API_KEY:
+    logger.warning("TTS(OpenAI): OPENAI_API_KEY not set; cannot initialize OpenAI client")
+    return False
+  try:
+    from openai import OpenAI  # type: ignore
+    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("TTS(OpenAI): client initialized")
+    return True
+  except Exception as exc:  # pragma: no cover - optional dependency
+    logger.exception("TTS(OpenAI): failed to initialize client: %s", exc)
+    return False
+
+
+async def _ensure_gemini_client() -> bool:
+  global _gemini_client, _genai_types
+  if _gemini_client is not None:
+    return True
+  if not GEMINI_API_KEY:
+    logger.warning("TTS(Gemini): GEMINI_API_KEY not set; cannot initialize Gemini client")
+    return False
+  try:
+    from google import genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
+  except Exception as exc:  # pragma: no cover - optional dependency
+    logger.warning("TTS(Gemini): google-genai not installed; cannot initialize Gemini client (%s)", exc)
+    return False
+
+  def _init() -> bool:
+    try:
+      client = genai.Client(api_key=GEMINI_API_KEY)
+      _gemini_client = client
+      _genai_types = genai_types
+      logger.info("TTS(Gemini): client initialized")
+      return True
+    except Exception as exc:  # pragma: no cover
+      logger.exception("TTS(Gemini): failed to initialize client: %s", exc)
+      return False
+
+  return await asyncio.to_thread(_init)
+
+
+async def _ensure_local_models() -> bool:
+  global _local_tts_model, _local_vocoder
+  if _local_tts_model is not None and _local_vocoder is not None:
+    return True
+  try:
+    from speechbrain.inference.TTS import Tacotron2  # type: ignore
+    from speechbrain.inference.vocoders import HIFIGAN  # type: ignore
+  except Exception as exc:  # pragma: no cover - optional dependency
+    logger.warning("TTS(Local): SpeechBrain not installed; cannot initialize local TTS (%s)", exc)
+    return False
+
+  def _load_models() -> bool:
+    try:
+      logger.info(
+        "TTS(Local): loading SpeechBrain models tts=%s vocoder=%s",
+        LOCAL_TTS_MODEL,
+        LOCAL_VOCODER_MODEL,
+      )
+      _local_tts_model = Tacotron2.from_hparams(
+        source=LOCAL_TTS_MODEL,
+        savedir="pretrained_models/tts-tacotron2-ljspeech",
+      )
+      _local_vocoder = HIFIGAN.from_hparams(
+        source=LOCAL_VOCODER_MODEL,
+        savedir="pretrained_models/tts-hifigan-ljspeech",
+      )
+      logger.info("TTS(Local): models loaded")
+      return True
+    except Exception as exc:  # pragma: no cover
+      logger.exception("TTS(Local): failed to load models: %s", exc)
+      return False
+
+  return await asyncio.to_thread(_load_models)
+
+
+async def initialize_tts_backends(warm_fallback: bool = True) -> dict:
+  """
+  Warm up the configured TTS backend (and optional fallback) during app startup.
+  Returns a dict of provider -> bool indicating initialization success.
+  """
+  global _tts_initialized
+  if _tts_initialized:
+    return {"status": "already_initialized"}
+
+  requested = (TTS_PROVIDER or "openai").lower()
+  statuses = {}
+
+  if requested == "gemini":
+    statuses["gemini"] = await _ensure_gemini_client()
+  elif requested in {"local", "speechbrain"}:
+    statuses["local"] = await _ensure_local_models()
+  else:
+    statuses["openai"] = _ensure_openai_client()
+
+  # Warm OpenAI as fallback if configured provider is not OpenAI
+  if warm_fallback and requested != "openai":
+    statuses["openai"] = _ensure_openai_client()
+
+  _tts_initialized = True
+  return statuses

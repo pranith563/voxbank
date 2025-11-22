@@ -19,6 +19,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     redis = None  # type: ignore
 
+from .voice_profile import DEFAULT_VOICE_PROFILE, merge_voice_profile
+
 
 class SessionManager:
     """
@@ -53,6 +55,7 @@ class SessionManager:
             "preferred_language": "en",
             "stt_lang": "en-IN",
             "tts_lang": "en-IN",
+            "voice_profile": dict(DEFAULT_VOICE_PROFILE),
             "created_at": now,
             "last_activity": now,
             # High-level chat history used by the orchestrator (role/text)
@@ -91,6 +94,10 @@ class SessionManager:
                 session["stt_lang"] = "en-IN"
             if "tts_lang" not in session:
                 session["tts_lang"] = "en-IN"
+            if "voice_profile" not in session or not session.get("voice_profile"):
+                session["voice_profile"] = dict(DEFAULT_VOICE_PROFILE)
+            else:
+                session["voice_profile"] = merge_voice_profile(session.get("voice_profile"))
         # Optionally refresh user_id if newly provided
         if user_id and not session.get("user_id"):
             session["user_id"] = user_id

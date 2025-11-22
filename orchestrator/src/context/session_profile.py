@@ -13,6 +13,7 @@ import httpx
 
 from logging_config import get_logger
 from .session_manager import get_session_manager
+from .voice_profile import get_voice_profile
 
 
 logger = get_logger("voxbank.orchestrator")
@@ -48,6 +49,7 @@ def get_session_profile(session_id: str) -> Dict[str, Any]:
         "is_voice_verified": bool(sess.get("is_voice_verified")),
         "primary_account": sess.get("primary_account"),
         "accounts": sess.get("accounts") or [],
+        "voice_profile": get_voice_profile(sess),
     }
     logger.info(
         "Session profile for %s -> user_id=%s username=%s primary_account=%s accounts=%d",
