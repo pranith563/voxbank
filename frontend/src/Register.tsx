@@ -1,13 +1,10 @@
 import React, { useState, useRef } from "react";
+import { Mic, Square, Play } from "lucide-react";
 
 interface RegisterResult {
   status: string;
   user?: any;
   error?: string;
-}
-
-interface RegisterProps {
-  onRegistered?: (user: any) => void;
 }
 
 interface RegisterProps {
@@ -101,7 +98,7 @@ export default function Register({ sessionId, onRegistered }: RegisterProps): JS
       };
 
       // Call orchestrator auth register endpoint, which proxies to mock-bank
-      const resp = await fetch("/api/auth/register", {
+      const resp = await fetch("http://localhost:8000/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -127,112 +124,133 @@ export default function Register({ sessionId, onRegistered }: RegisterProps): JS
   }
 
   return (
-    <div className="max-w-xl mx-auto bg-white border border-slate-200 rounded-2xl shadow-sm p-6">
-      <h2 className="text-lg font-semibold mb-4">Register for VoxBank</h2>
-      <p className="text-sm text-slate-600 mb-6">
-        Create a user with a passphrase and an optional voice sample (for future voice authentication).
-      </p>
+    <div className="max-w-2xl mx-auto glass-panel rounded-2xl p-8 animate-accordion-down">
+      <div className="text-center mb-8">
+        <h2 className="text-2xl font-bold text-foreground mb-2 tracking-wider">JOIN VOXBANK</h2>
+        <p className="text-sm text-muted-foreground">
+          Create your secure identity. Voice authentication optional.
+        </p>
+      </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
-          <input
-            className="w-full border rounded-md px-3 py-2 text-sm"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            required
-          />
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Passphrase</label>
-          <input
-            type="password"
-            className="w-full border rounded-md px-3 py-2 text-sm"
-            value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
-            required
-          />
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-neon-blue uppercase tracking-wider">Username</label>
             <input
-              className="w-full border rounded-md px-3 py-2 text-sm"
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none transition-all placeholder:text-muted-foreground"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+              placeholder="jdoe"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-neon-blue uppercase tracking-wider">Passphrase</label>
+            <input
+              type="password"
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none transition-all placeholder:text-muted-foreground"
+              value={passphrase}
+              onChange={(e) => setPassphrase(e.target.value)}
+              required
+              placeholder="••••••••"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-muted-foreground uppercase tracking-wider">Email</label>
+            <input
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue outline-none transition-all placeholder:text-muted-foreground"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+              placeholder="john@example.com"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Full Name</label>
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-muted-foreground uppercase tracking-wider">Full Name</label>
             <input
-              className="w-full border rounded-md px-3 py-2 text-sm"
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue outline-none transition-all placeholder:text-muted-foreground"
               value={fullName}
               onChange={(e) => setFullName(e.target.value)}
+              placeholder="John Doe"
             />
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Phone Number</label>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-muted-foreground uppercase tracking-wider">Phone Number</label>
             <input
-              className="w-full border rounded-md px-3 py-2 text-sm"
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue outline-none transition-all placeholder:text-muted-foreground"
               value={phoneNumber}
               onChange={(e) => setPhoneNumber(e.target.value)}
+              placeholder="+91 0000000000"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Address</label>
+          <div className="space-y-2">
+            <label className="block text-xs font-medium text-muted-foreground uppercase tracking-wider">Address</label>
             <input
-              className="w-full border rounded-md px-3 py-2 text-sm"
+              className="w-full bg-background/50 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue outline-none transition-all placeholder:text-muted-foreground"
               value={address}
               onChange={(e) => setAddress(e.target.value)}
+              placeholder="123 Future St"
             />
           </div>
         </div>
 
-        <div className="mt-4 border-t pt-4">
-          <h3 className="text-sm font-semibold text-slate-800 mb-2">Voice Sample (optional)</h3>
-          <p className="text-xs text-slate-500 mb-2">
-            Record a short phrase in your normal voice. This audio will be converted to an embedding and stored for future voice authentication.
-          </p>
-          <div className="flex items-center gap-3">
+        <div className="mt-8 p-6 border border-border rounded-xl bg-secondary/10">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-sm font-semibold text-neon-purple mb-1">Voice Security</h3>
+              <p className="text-xs text-muted-foreground">
+                Record a phrase for biometric authentication.
+              </p>
+            </div>
+            {isRecording && <div className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />}
+          </div>
+
+          <div className="flex items-center gap-4">
             {!isRecording ? (
               <button
                 type="button"
                 onClick={startRecording}
-                className="px-3 py-2 text-sm rounded-md bg-red-600 text-white hover:bg-red-700"
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30 transition-all text-xs font-medium"
               >
-                Start Recording
+                <Mic className="w-4 h-4" />
+                Record Sample
               </button>
             ) : (
               <button
                 type="button"
                 onClick={stopRecording}
-                className="px-3 py-2 text-sm rounded-md bg-slate-700 text-white hover:bg-slate-800"
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-secondary text-secondary-foreground hover:bg-secondary/80 transition-all text-xs font-medium"
               >
+                <Square className="w-4 h-4 fill-current" />
                 Stop Recording
               </button>
             )}
+
             {audioPreviewUrl && (
-              <audio controls src={audioPreviewUrl} className="h-8">
-                Your browser does not support audio playback.
-              </audio>
+              <div className="flex items-center gap-2 px-3 py-2 rounded-full bg-neon-blue/10 border border-neon-blue/30">
+                <Play className="w-3 h-3 text-neon-blue" />
+                <span className="text-xs text-neon-blue">Sample Recorded</span>
+                <audio src={audioPreviewUrl} className="hidden" />
+              </div>
             )}
           </div>
         </div>
 
-        <div className="pt-4 flex items-center justify-between">
+        <div className="pt-6 flex items-center justify-between border-t border-border">
+          {statusMsg && <p className="text-xs text-neon-blue animate-pulse">{statusMsg}</p>}
           <button
             type="submit"
             disabled={isSubmitting}
-            className="px-4 py-2 rounded-md bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 disabled:opacity-60"
+            className="ml-auto px-8 py-3 rounded-full bg-gradient-to-r from-neon-blue to-neon-purple text-white font-bold text-sm hover:shadow-[0_0_20px_rgba(0,243,255,0.4)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {isSubmitting ? "Registering..." : "Register"}
+            {isSubmitting ? "PROCESSING..." : "CREATE ACCOUNT"}
           </button>
-          {statusMsg && <p className="text-xs text-slate-600 ml-3">{statusMsg}</p>}
         </div>
       </form>
     </div>

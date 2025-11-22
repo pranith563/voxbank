@@ -1,4 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { Mic, MessageSquare, X, Volume2, Sparkles } from "lucide-react";
+import BankingLoader from "./components/BankingLoader";
 
 /* ----- Types for SpeechRecognition (TS) ----- */
 declare global {
@@ -9,10 +11,7 @@ declare global {
 }
 
 const WS_URL = "ws://localhost:8000/ws";
-// 2 seconds silence
 const SILENCE_TIMEOUT_MS = 2000;
-// Toggle to prefer server-side TTS (audio from backend) vs browser speechSynthesis.
-// When true, the client requests audio over WebSocket and will not use browser TTS.
 const USE_SERVER_TTS = true;
 
 type AgentMode = "idle" | "listening" | "thinking" | "speaking";
@@ -30,6 +29,9 @@ export default function VoiceSearchGeminiBrowser({
   sessionId,
   onForceLogout,
 }: Props): JSX.Element {
+  // Initial Loader State
+  const [isLoading, setIsLoading] = useState(true);
+
   // UI / recognition states
   const [listening, setListening] = useState(false);
   const listeningRef = useRef<boolean>(false);
@@ -58,14 +60,11 @@ export default function VoiceSearchGeminiBrowser({
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
 
-  const triggerForceLogout = useCallback(() => {
-    if (onForceLogout) {
-      onForceLogout();
-    }
-  }, [onForceLogout]);
-
   // ---------- lifecycle ----------
   useEffect(() => {
+    // Simulate initial loading for effect
+    const timer = setTimeout(() => setIsLoading(false), 1000);
+
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
       console.error("SpeechRecognition not supported in this browser.");
@@ -117,7 +116,13 @@ export default function VoiceSearchGeminiBrowser({
       wasListeningBeforePlaybackRef.current = false;
     };
 
+    // Connect WS on mount
+    if (!wsRef.current) {
+      wsRef.current = createWebSocket();
+    }
+
     return () => {
+      clearTimeout(timer);
       clearSilenceTimer();
       try {
         if (recognitionRef.current) {
@@ -127,16 +132,19 @@ export default function VoiceSearchGeminiBrowser({
           recognitionRef.current.stop();
           recognitionRef.current = null;
         }
-      } catch (e) {}
+      } catch (e) { }
       try {
-        if (wsRef.current) wsRef.current.close();
-      } catch (e) {}
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+      } catch (e) { }
       if (audioRef.current) {
         try {
           audioRef.current.onplay = null;
           audioRef.current.onended = null;
           audioRef.current.src = "";
-        } catch (e) {}
+        } catch (e) { }
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -213,7 +221,14 @@ export default function VoiceSearchGeminiBrowser({
 
         if (parsed && parsed.type === "logout") {
           console.log("[WS] logout event received");
-          triggerForceLogout();
+          if (onForceLogout) onForceLogout();
+          return;
+        }
+
+        if (parsed && parsed.type === "error") {
+          console.log("[WS] Error from backend:", parsed.message);
+          setAgentMode("speaking");
+          speak("Sorry there is an error. Please try once again");
           return;
         }
 
@@ -226,7 +241,7 @@ export default function VoiceSearchGeminiBrowser({
             speak(parsed.text);
           }
           if (parsed.logged_out) {
-            triggerForceLogout();
+            if (onForceLogout) onForceLogout();
           }
           return;
         }
@@ -294,7 +309,7 @@ export default function VoiceSearchGeminiBrowser({
       }
       // revoke URL after some time
       setTimeout(() => {
-        try { URL.revokeObjectURL(url); } catch (e) {}
+        try { URL.revokeObjectURL(url); } catch (e) { }
       }, 60000);
     } catch (err) {
       console.error("[Audio] playArrayBufferAudio failed:", err);
@@ -324,24 +339,27 @@ export default function VoiceSearchGeminiBrowser({
   }
 
   // ---------- Send transcript (only new part) ----------
-  function sendTranscriptIfNew() {
+  function sendTranscriptIfNew(): boolean {
     const full = (finalTranscriptRef.current || "").trim();
-    if (!full) return;
+    if (!full) return false;
     const lastIdx = lastSentCharIndexRef.current;
     if (lastIdx >= full.length) {
       console.log("[Send] nothing new to send");
-      return;
+      return false;
     }
     const newText = full.slice(lastIdx).trim();
     if (!newText) {
       console.log("[Send] new substring empty after trim");
       lastSentCharIndexRef.current = full.length;
-      return;
+      return false;
     }
 
     const payload = { type: "transcript", text: newText, session_id: sessionId, output_audio: USE_SERVER_TTS };
 
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      // If WS is not open, we might need to reconnect or just log error.
+      // Since we now connect on mount, if it's closed here it might be an error state.
+      console.warn("[Send] WebSocket not open. Attempting to reconnect...");
       wsRef.current = createWebSocket();
       wsRef.current.onopen = () => {
         try {
@@ -363,6 +381,7 @@ export default function VoiceSearchGeminiBrowser({
     setChatMessages((prev) => [...prev, { role: "user", text: newText }]);
     console.log("[Send] sent new text:", newText);
     lastSentCharIndexRef.current = full.length;
+    return true;
   }
 
   // ---------- SpeechRecognition ----------
@@ -400,7 +419,7 @@ export default function VoiceSearchGeminiBrowser({
     recognition.maxAlternatives = 1;
     recognition.continuous = true;
 
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
+    recognition.onresult = (event: any) => {
       // reset silence timer whenever we get result (interim or final)
       startOrResetSilenceTimer();
 
@@ -461,7 +480,7 @@ export default function VoiceSearchGeminiBrowser({
     }
   }
 
-  function stopRecognition() {
+  function stopRecognition(retainMode: boolean = false) {
     clearSilenceTimer();
     try {
       if (recognitionRef.current) {
@@ -474,7 +493,9 @@ export default function VoiceSearchGeminiBrowser({
     setListening(false);
     // ensure ref cleared
     recognitionRef.current = null;
-    setAgentMode("idle");
+    if (!retainMode) {
+      setAgentMode("idle");
+    }
   }
 
   // ---------- UI handlers ----------
@@ -483,12 +504,16 @@ export default function VoiceSearchGeminiBrowser({
     if (listeningRef.current || pausedForPlaybackRef.current) {
       console.log("[UI] Mic re-click: stop all (user explicit)");
       userStoppedRef.current = true;
-      stopRecognition();
+
+      // Send any pending transcript before stopping
+      const sent = sendTranscriptIfNew();
+
+      stopRecognition(sent);
       if (audioRef.current && !audioRef.current.paused) {
         try {
           audioRef.current.pause();
           audioRef.current.currentTime = 0;
-        } catch (e) {}
+        } catch (e) { }
       }
       pausedForPlaybackRef.current = false;
       setPausedForPlayback(false);
@@ -501,134 +526,196 @@ export default function VoiceSearchGeminiBrowser({
     startRecognition();
   }
 
-  function handleManualSend() {
-    const full = (finalTranscriptRef.current || "").trim();
-    if (!full) {
-      alert("No transcript to send.");
-      return;
-    }
-    sendTranscriptIfNew();
+  // ---------- Render ----------
+  if (isLoading) {
+    return <BankingLoader />;
   }
 
-  // ---------- Render ----------
-  const showWaves = agentMode !== "idle";
   const modeLabel =
     agentMode === "listening"
       ? "Listening..."
       : agentMode === "thinking"
-      ? "Thinking..."
-      : agentMode === "speaking"
-      ? "Speaking..."
-      : "Tap to speak";
+        ? "Processing..."
+        : agentMode === "speaking"
+          ? "Speaking..."
+          : "Tap to speak";
 
-  const ringColor =
-    agentMode === "listening"
-      ? "bg-blue-600 shadow-[0_0_40px_rgba(37,99,235,0.7)]"
-      : agentMode === "thinking"
-      ? "bg-indigo-600 shadow-[0_0_40px_rgba(79,70,229,0.7)]"
-      : agentMode === "speaking"
-      ? "bg-emerald-600 shadow-[0_0_40px_rgba(16,185,129,0.7)]"
-      : "bg-slate-800 shadow-xl";
+
 
   return (
-    <>
-      <div className="w-full flex flex-col items-center justify-center py-10">
-        <div className="flex flex-col items-center gap-6">
-          {/* Mic button */}
-          <div
-            onClick={handleMicClick}
-            role="button"
-            aria-pressed={listening}
-            className={`relative w-40 h-40 rounded-full flex items-center justify-center cursor-pointer select-none transition-shadow duration-300 ${ringColor}`}
-          >
-            {/* Inner mic icon */}
-            <div className="w-16 h-16 rounded-full bg-slate-900 flex items-center justify-center">
-              <span className="text-3xl text-white">🎙</span>
-            </div>
+    <div className="h-[calc(100vh-5rem)] w-full bg-background text-foreground overflow-hidden relative flex flex-col">
+      {/* Background Elements */}
+      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] bg-neon-blue/10 rounded-full blur-[120px]" />
+        <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-neon-purple/10 rounded-full blur-[120px]" />
+      </div>
 
-            {/* Animated ring */}
-            {showWaves && (
-              <svg
-                className="absolute inset-0 w-full h-full"
-                viewBox="0 0 160 160"
-                fill="none"
-                xmlns="http://www.w3.org/2000/svg"
-                aria-hidden
-              >
-                <g>
-                  <circle cx="80" cy="80" r="52" stroke="rgba(255,255,255,0.20)" strokeWidth="2">
-                    <animate attributeName="r" from="52" to="72" dur="1.6s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" from="0.9" to="0" dur="1.6s" repeatCount="indefinite" />
-                  </circle>
-                  <circle cx="80" cy="80" r="42" stroke="rgba(255,255,255,0.15)" strokeWidth="2">
-                    <animate attributeName="r" from="42" to="68" dur="1.6s" begin="0.4s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" from="0.8" to="0" dur="1.6s" begin="0.4s" repeatCount="indefinite" />
-                  </circle>
-                  <circle cx="80" cy="80" r="34" stroke="rgba(255,255,255,0.10)" strokeWidth="2">
-                    <animate attributeName="r" from="34" to="60" dur="1.6s" begin="0.8s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" from="0.7" to="0" dur="1.6s" begin="0.8s" repeatCount="indefinite" />
-                  </circle>
-                </g>
-              </svg>
+      {/* Main Content - Voice First Interface */}
+      <main className="flex-1 relative z-10 flex flex-col items-center justify-center p-4 pb-24">
+
+        {/* Status Indicator */}
+        <div className="mb-32 flex-shrink-0 text-center relative z-20">
+          <h2 className="text-3xl md:text-5xl font-light tracking-tight mb-4">
+            {agentMode === "idle" ? (
+              <span className="text-muted-foreground">How can I help you?</span>
+            ) : (
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-neon-blue to-neon-purple animate-pulse">
+                {modeLabel}
+              </span>
             )}
+          </h2>
+          <p className="text-muted-foreground text-sm tracking-widest uppercase">
+            AI Banking Assistant
+          </p>
+        </div>
+
+        {/* Central Shielded Core / Mic Interaction */}
+        <div className="relative group flex items-center justify-center flex-shrink-0">
+          {/* --- Ambient Glow (Base) --- */}
+          <div className={`absolute inset-0 bg-neon-blue/20 blur-[100px] rounded-full transition-all duration-1000 ${agentMode === 'listening' ? 'scale-150 opacity-60' : 'scale-100 opacity-30'
+            }`} />
+
+          {/* --- Outer Shield Ring (Static/Slow) --- */}
+          <div className={`absolute w-64 h-64 md:w-80 md:h-80 rounded-full border border-secondary/10 flex items-center justify-center transition-all duration-700 ${agentMode === 'listening' ? 'scale-110 border-neon-blue/30' : 'scale-100'
+            }`}>
+            {/* Decorative ticks on outer ring */}
+            <div className="absolute inset-0 rounded-full border-t border-b border-border rotate-45" />
           </div>
 
-          {/* Mode label */}
-          <div className="px-6 py-2 rounded-full bg-slate-900/90 text-white text-sm shadow-md mt-2">
-            {modeLabel}
+          {/* --- Middle Rotating Shield (The "Vault Lock") --- */}
+          <div className={`absolute w-52 h-52 md:w-64 md:h-64 rounded-full border border-border flex items-center justify-center transition-all duration-1000 ${agentMode === 'thinking' ? 'animate-spin-slow border-neon-purple/50' :
+            agentMode === 'listening' ? 'animate-[spin_20s_linear_infinite] border-neon-blue/40' :
+              'rotate-0 border-border'
+            }`}>
+            <div className="absolute top-0 w-1 h-1 bg-foreground/50 rounded-full shadow-[0_0_10px_white]" />
+            <div className="absolute bottom-0 w-1 h-1 bg-foreground/50 rounded-full shadow-[0_0_10px_white]" />
+            <div className="absolute left-0 w-1 h-1 bg-foreground/50 rounded-full shadow-[0_0_10px_white]" />
+            <div className="absolute right-0 w-1 h-1 bg-foreground/50 rounded-full shadow-[0_0_10px_white]" />
           </div>
 
-          {/* Transcript below mic */}
-          <div className="mt-4 w-full max-w-xl text-center text-sm text-slate-700 min-h-[40px] px-4 py-3 rounded-2xl bg-white/80 border border-slate-200 shadow-sm">
-            {transcript || (interim ? interim : "No speech yet")}
-          </div>
+          {/* --- Inner Rotating Ring (Reverse) --- */}
+          <div className={`absolute w-40 h-40 md:w-48 md:h-48 rounded-full border-2 border-dashed border-secondary/20 transition-all duration-700 ${agentMode === 'thinking' ? 'animate-spin-reverse-slower border-neon-purple' :
+            agentMode === 'listening' ? 'animate-[spin_15s_linear_infinite_reverse] border-neon-blue' :
+              'rotate-45 border-border'
+            }`} />
 
-          <div className="mt-2 text-xs text-slate-400">
-            Auto-sends after 2s of silence. Tap again to stop listening or playback.
+          {/* --- Ripple Effect (Speaking) --- */}
+          {agentMode === 'speaking' && (
+            <>
+              <div className="absolute w-32 h-32 rounded-full border border-neon-green/50 animate-ripple" />
+              <div className="absolute w-32 h-32 rounded-full border border-neon-green/30 animate-ripple delay-75" />
+              <div className="absolute w-32 h-32 rounded-full border border-neon-green/10 animate-ripple delay-150" />
+            </>
+          )}
+
+          {/* --- The Core (Button) --- */}
+          <button
+            onClick={handleMicClick}
+            aria-pressed={listening}
+            className={`relative z-20 w-32 h-32 md:w-40 md:h-40 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl border-4 ${agentMode === 'listening' ? 'bg-background border-neon-blue shadow-[0_0_50px_rgba(0,243,255,0.4)] scale-105' :
+              agentMode === 'thinking' ? 'bg-background border-neon-purple shadow-[0_0_50px_rgba(188,19,254,0.4)] scale-95' :
+                agentMode === 'speaking' ? 'bg-background border-neon-green shadow-[0_0_50px_rgba(10,255,104,0.4)] scale-105' :
+                  'bg-slate-900 border-slate-700 shadow-[0_0_30px_rgba(0,0,0,0.5)] hover:border-slate-500'
+              }`}
+          >
+            {/* Core Inner Glow */}
+            <div className={`absolute inset-2 rounded-full opacity-50 transition-colors duration-500 ${agentMode === 'listening' ? 'bg-neon-blue animate-pulse-fast' :
+              agentMode === 'thinking' ? 'bg-neon-purple animate-pulse' :
+                agentMode === 'speaking' ? 'bg-neon-green' :
+                  'bg-slate-800'
+              }`} />
+
+            {/* Icon */}
+            <div className="relative z-30">
+              {agentMode === "listening" ? (
+                <Mic className="w-10 h-10 md:w-12 md:h-12 text-foreground drop-shadow-[0_0_10px_rgba(255,255,255,0.8)]" />
+              ) : agentMode === "speaking" ? (
+                <Volume2 className="w-10 h-10 md:w-12 md:h-12 text-neon-green drop-shadow-[0_0_10px_rgba(10,255,104,0.8)]" />
+              ) : agentMode === "thinking" ? (
+                <Sparkles className="w-10 h-10 md:w-12 md:h-12 text-neon-purple animate-pulse drop-shadow-[0_0_10px_rgba(188,19,254,0.8)]" />
+              ) : (
+                <Mic className="w-10 h-10 md:w-12 md:h-12 text-muted-foreground group-hover:text-foreground transition-colors" />
+              )}
+            </div>
+          </button>
+        </div>
+
+        {/* Live Transcript */}
+        <div className="mt-24 h-24 w-full max-w-2xl flex items-center justify-center text-center px-4">
+          <p className="text-lg md:text-2xl text-muted-foreground font-light leading-relaxed">
+            {transcript || interim || (
+              <span className="text-muted-foreground italic">Listening for command...</span>
+            )}
+          </p>
+        </div>
+
+      </main>
+
+      {/* Chat Trigger - Right Side Tab */}
+      <div className="fixed right-0 top-1/2 -translate-y-1/2 z-50">
+        <button
+          onClick={() => setChatOpen(!chatOpen)}
+          className={`
+            flex items-center justify-center w-10 h-24 
+            bg-card/80 backdrop-blur-md border-l border-t border-b border-border 
+            rounded-l-xl shadow-lg
+            hover:w-12 hover:bg-accent transition-all duration-300 group
+            ${chatOpen ? 'translate-x-full' : 'translate-x-0'}
+          `}
+        >
+          <div className="flex flex-col items-center gap-2">
+            <MessageSquare className="w-5 h-5 text-primary group-hover:scale-110 transition-transform" />
+            <div className="w-1 h-1 rounded-full bg-primary/50" />
+            <div className="w-1 h-1 rounded-full bg-primary/50" />
+            <div className="w-1 h-1 rounded-full bg-primary/50" />
           </div>
+        </button>
+      </div>
+
+      {/* Conversation History Sidebar */}
+      <div
+        className={`
+          fixed inset-y-0 right-0 w-80 md:w-96 bg-background/95 backdrop-blur-xl 
+          border-l border-border shadow-2xl
+          z-50 transform transition-transform duration-500 ease-out
+          flex flex-col
+          ${chatOpen ? 'translate-x-0' : 'translate-x-full'}
+        `}
+      >
+        <div className="p-6 border-b border-border flex justify-between items-center bg-muted/20">
+          <div className="flex items-center gap-2">
+            <MessageSquare className="w-5 h-5 text-primary" />
+            <span className="text-lg font-light tracking-wide text-foreground">History</span>
+          </div>
+          <button
+            onClick={() => setChatOpen(false)}
+            className="p-2 hover:bg-muted rounded-full transition-colors text-muted-foreground hover:text-foreground"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {chatMessages.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full text-muted-foreground/50 space-y-4">
+              <MessageSquare className="w-12 h-12 opacity-20" />
+              <p className="text-sm font-light">No conversation yet</p>
+            </div>
+          )}
+          {chatMessages.map((m, idx) => (
+            <div key={idx} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div
+                className={`max-w-[85%] p-4 rounded-2xl text-sm leading-relaxed shadow-sm ${m.role === "user"
+                  ? "bg-primary text-primary-foreground rounded-tr-sm"
+                  : "bg-muted text-foreground border border-border rounded-tl-sm"
+                  }`}
+              >
+                {m.text}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
-
-      {/* Collapsible chat window */}
-      <div className="fixed bottom-4 right-4 z-40">
-        <button
-          type="button"
-          onClick={() => setChatOpen((v) => !v)}
-          className="w-10 h-10 rounded-full bg-slate-900 text-white flex items-center justify-center shadow-lg hover:bg-slate-800 text-lg"
-          aria-label="Toggle chat history"
-        >
-          💬
-        </button>
-        {chatOpen && (
-          <div className="mt-2 w-80 max-h-96 bg-white shadow-2xl rounded-xl border border-slate-200 flex flex-col">
-            <div className="px-3 py-2 text-xs font-semibold text-slate-700 border-b border-slate-100 flex items-center justify-between">
-              <span>Conversation</span>
-              <span className="text-[10px] text-slate-400">user ↔ assistant</span>
-            </div>
-            <div className="p-3 flex-1 overflow-y-auto space-y-2 text-xs">
-              {chatMessages.length === 0 && (
-                <div className="text-slate-400">No messages yet.</div>
-              )}
-              {chatMessages.map((m, idx) => (
-                <div
-                  key={idx}
-                  className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-                >
-                  <div
-                    className={`px-2 py-1 rounded-lg max-w-[75%] ${
-                      m.role === "user"
-                        ? "bg-slate-900 text-white"
-                        : "bg-slate-100 text-slate-800"
-                    }`}
-                  >
-                    {m.text}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </>
+    </div>
   );
 }

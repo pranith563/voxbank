@@ -59,46 +59,49 @@ export default function Login({ sessionId, onLoggedIn }: LoginProps): JSX.Elemen
   }
 
   return (
-    <div className="max-w-md mx-auto bg-white border border-slate-200 rounded-2xl shadow-sm p-6">
-      <h2 className="text-lg font-semibold mb-4">Login to VoxBank</h2>
-      <p className="text-sm text-slate-600 mb-6">
-        Enter your username and passphrase to access your VoxBank assistant.
-      </p>
+    <div className="max-w-md mx-auto glass-panel rounded-2xl p-8 animate-accordion-down">
+      <div className="text-center mb-8">
+        <h2 className="text-2xl font-bold text-foreground mb-2 tracking-wider">LOGIN</h2>
+        <p className="text-sm text-muted-foreground">
+          Enter credentials to unlock your account.
+        </p>
+      </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="space-y-2">
+          <label className="block text-xs font-medium text-neon-blue uppercase tracking-wider">Username</label>
           <input
-            className="w-full border rounded-md px-3 py-2 text-sm"
+            className="w-full bg-secondary/10 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none transition-all placeholder:text-muted-foreground"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             required
+            placeholder="Enter username"
           />
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">Passphrase</label>
+        <div className="space-y-2">
+          <label className="block text-xs font-medium text-neon-blue uppercase tracking-wider">Passphrase</label>
           <input
             type="password"
-            className="w-full border rounded-md px-3 py-2 text-sm"
+            className="w-full bg-secondary/10 border border-border rounded-lg px-4 py-3 text-sm text-foreground focus:border-neon-blue focus:ring-1 focus:ring-neon-blue outline-none transition-all placeholder:text-muted-foreground"
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             required
+            placeholder="Enter passphrase"
           />
         </div>
 
-        <div className="pt-4 flex items-center justify-between">
+        <div className="pt-6 flex items-center justify-between border-t border-border">
+          {statusMsg && <p className="text-xs text-neon-blue animate-pulse">{statusMsg}</p>}
           <button
             type="submit"
             disabled={isSubmitting}
-            className="px-4 py-2 rounded-md bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 disabled:opacity-60"
+            className="ml-auto px-8 py-3 rounded-full bg-gradient-to-r from-neon-blue to-neon-purple text-foreground font-bold text-sm hover:shadow-[0_0_20px_rgba(0,243,255,0.4)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {isSubmitting ? "Logging in..." : "Login"}
+            {isSubmitting ? "AUTHENTICATING..." : "LOGIN"}
           </button>
-          {statusMsg && <p className="text-xs text-slate-600 ml-3">{statusMsg}</p>}
         </div>
       </form>
     </div>
   );
 }
-

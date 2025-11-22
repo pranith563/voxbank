@@ -3,6 +3,7 @@ import "./index.css";
 import Register from "./Register";
 import VoiceSearchGeminiBrowser from "./VoiceSearchGeminiBrowser";
 import Login from "./Login";
+import Header from "./components/Header";
 
 function generateSessionId() {
   if (typeof window !== "undefined" && "crypto" in window && "randomUUID" in window.crypto) {
@@ -26,6 +27,18 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [language, setLanguage] = useState("en-US");
   const [voiceType, setVoiceType] = useState("default");
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+
+  // Toggle Theme Effect
+  useEffect(() => {
+    const root = window.document.documentElement;
+    root.classList.remove("light", "dark");
+    root.classList.add(theme);
+  }, [theme]);
+
+  const toggleTheme = (newTheme: "dark" | "light") => {
+    setTheme(newTheme);
+  };
 
   useEffect(() => {
     if (!sessionId) return;
@@ -89,82 +102,25 @@ function App() {
   }, [sessionId]);
 
   return (
-    <div className="min-h-screen bg-white">
-      {/* Fixed header (another file can render content into this area too) */}
-      <header className="fixed top-0 left-0 w-full h-20 bg-slate-800 text-white z-50 shadow-md">
-        <div className="max-w-6xl mx-auto h-full px-6 flex items-center justify-between">
-          <div className="text-left">
-            <h1 className="text-lg font-semibold">VoxBank</h1>
-            <p className="text-sm text-slate-200">Your AI Voice Banking Companion</p>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setView("assistant")}
-              className={`px-3 py-1 text-xs rounded-full border ${
-                view === "assistant"
-                  ? "bg-white text-slate-800 border-white"
-                  : "border-slate-400 text-slate-100"
-              }`}
-            >
-              Assistant
-            </button>
-            <button
-              onClick={() => {
-                if (!currentUser) {
-                  setView("register");
-                }
-              }}
-              className={`px-3 py-1 text-xs rounded-full border hidden sm:inline-flex ${
-                view === "register"
-                  ? "bg-white text-slate-800 border-white"
-                  : "border-slate-400 text-slate-100"
-              }`}
-              disabled={!!currentUser}
-            >
-              {currentUser ? currentUser : "Register"}
-            </button>
-
-            {/* Login button (only when logged out) */}
-            {!currentUser && (
-              <button
-                onClick={() => setView("login")}
-                className={`px-3 py-1 text-xs rounded-full border hidden sm:inline-flex ${
-                  view === "login"
-                    ? "bg-white text-slate-800 border-white"
-                    : "border-slate-400 text-slate-100"
-                }`}
-              >
-                Login
-              </button>
-            )}
-
-            {/* Settings button */}
-            <button
-              type="button"
-              onClick={() => setSettingsOpen((v) => !v)}
-              className="w-8 h-8 flex items-center justify-center rounded-full bg-slate-700 hover:bg-slate-600 text-xs"
-              aria-label="Settings"
-            >
-              ⚙
-            </button>
-
-            {/* Logout / login indicator */}
-            {currentUser && (
-              <button
-                type="button"
-                onClick={handleLogout}
-                className="px-3 py-1 text-xs rounded-full border border-slate-400 text-slate-100 hover:bg-slate-700"
-              >
-                Logout
-              </button>
-            )}
-          </div>
-        </div>
-      </header>
+    <div className="min-h-screen bg-background text-foreground transition-colors duration-300">
+      <Header
+        view={view}
+        setView={setView}
+        currentUser={currentUser}
+        onLogout={handleLogout}
+        settingsOpen={settingsOpen}
+        setSettingsOpen={setSettingsOpen}
+        theme={theme}
+        toggleTheme={toggleTheme}
+        language={language}
+        setLanguage={setLanguage}
+        voiceType={voiceType}
+        setVoiceType={setVoiceType}
+      />
 
       {/* Main content: pad top so header doesn't overlap */}
-      <main className="pt-20">
-        <div className="max-w-6xl mx-auto px-6 py-12">
+      <main className="pt-20 min-h-screen flex flex-col">
+        <div className="flex-1 w-full">
           {view === "assistant" && (
             <VoiceSearchGeminiBrowser
               language={language}
@@ -174,60 +130,33 @@ function App() {
             />
           )}
           {view === "register" && (
-            <Register
-              sessionId={sessionId}
-              onRegistered={(user) => {
-                if (user?.username) {
-                  setCurrentUser(user.username);
-                }
-                setView("assistant");
-              }}
-            />
+            <div className="max-w-6xl mx-auto px-6 py-12">
+              <Register
+                sessionId={sessionId}
+                onRegistered={(user) => {
+                  if (user?.username) {
+                    setCurrentUser(user.username);
+                  }
+                  setView("assistant");
+                }}
+              />
+            </div>
           )}
           {view === "login" && (
-            <Login
-              sessionId={sessionId}
-              onLoggedIn={(user) => {
-                if (user?.username) {
-                  setCurrentUser(user.username);
-                }
-                setView("assistant");
-              }}
-            />
+            <div className="max-w-6xl mx-auto px-6 py-12">
+              <Login
+                sessionId={sessionId}
+                onLoggedIn={(user) => {
+                  if (user?.username) {
+                    setCurrentUser(user.username);
+                  }
+                  setView("assistant");
+                }}
+              />
+            </div>
           )}
         </div>
       </main>
-
-      {/* Settings panel */}
-      {settingsOpen && (
-        <div className="fixed top-20 right-4 z-40 w-64 bg-white shadow-lg rounded-xl border border-slate-200 p-4">
-          <h3 className="text-sm font-semibold text-slate-800 mb-3">Settings</h3>
-          <div className="mb-3">
-            <label className="block text-xs font-medium text-slate-600 mb-1">Language</label>
-            <select
-              className="w-full border rounded-md px-2 py-1 text-xs"
-              value={language}
-              onChange={(e) => setLanguage(e.target.value)}
-            >
-              <option value="en-US">English (US)</option>
-              <option value="en-GB">English (UK)</option>
-              <option value="en-IN">English (India)</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-600 mb-1">Voice type</label>
-            <select
-              className="w-full border rounded-md px-2 py-1 text-xs"
-              value={voiceType}
-              onChange={(e) => setVoiceType(e.target.value)}
-            >
-              <option value="default">Default</option>
-              <option value="female">Female</option>
-              <option value="male">Male</option>
-            </select>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
