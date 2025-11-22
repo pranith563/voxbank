@@ -549,11 +549,10 @@ async def get_my_beneficiaries(
             "status": "error",
             "message": "No user context available for get_my_beneficiaries.",
         }
-    return await get_user_beneficiaries(user_id=user_id, limit=limit, offset=offset)
+    return await _get_user_beneficiaries(user_id=user_id, limit=limit, offset=offset)
 
 
-@mcp.tool(name="get_user_beneficiaries", description="List beneficiaries for a user")
-async def get_user_beneficiaries(user_id: str, limit: int = 50, offset: int = 0) -> dict:
+async def _get_user_beneficiaries(user_id: str, limit: int = 50, offset: int = 0) -> dict:
     """
     Wraps GET /api/users/{user_id}/beneficiaries.
     """
@@ -571,6 +570,12 @@ async def get_user_beneficiaries(user_id: str, limit: int = 50, offset: int = 0)
         "user_id": user_id,
         "beneficiaries": result["data"],
     }
+
+
+@mcp.tool(name="get_user_beneficiaries", description="List beneficiaries for a user")
+async def get_user_beneficiaries(user_id: str, limit: int = 50, offset: int = 0) -> dict:  # noqa: D401
+    """Tool wrapper delegating to _get_user_beneficiaries."""
+    return await _get_user_beneficiaries(user_id=user_id, limit=limit, offset=offset)
 
 
 @mcp.tool(name="add_beneficiary", description="Add a new beneficiary for a user")

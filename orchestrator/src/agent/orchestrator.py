@@ -18,6 +18,7 @@ from otp_manager import OtpManager
 from .agent import VoxBankAgent
 from .helpers import (
     build_user_context_block,
+    deterministic_fallback,
     render_history_for_prompt,
 )
 from .normalizer import normalize_input
@@ -124,6 +125,8 @@ class ConversationOrchestrator:
         iterations = 0
         parsed: Optional[Dict[str, Any]] = None
         tool_result: Any = None
+        last_tool_name: Optional[str] = None
+        last_tool_input: Optional[Dict[str, Any]] = None
         logout_requested = False
 
         # Normalize raw transcript once per turn via the small normalizer LLM
@@ -261,6 +264,42 @@ class ConversationOrchestrator:
                 )
                 return respond_result
 
+            if (
+                action == "call_tool"
+                and requires_tool
+                and tool_name
+                and tool_result is not None
+                and tool_name == last_tool_name
+                and (tool_input or {}) == (last_tool_input or {})
+            ):
+                logger.info(
+                    "Reusing existing tool result for tool=%s instead of re-calling (iter %d)",
+                    tool_name,
+                    iterations,
+                )
+                try:
+                    final_reply = await self.agent.generate_response(
+                        intent or "unknown",
+                        parsed.get("tool_input", {}) if parsed else {},
+                        tool_result,
+                        reply_style=reply_style,
+                    )
+                except Exception as exc:
+                    logger.exception("generate_response failed while reusing tool result: %s", exc)
+                    final_reply = deterministic_fallback(
+                        intent or "unknown",
+                        parsed.get("tool_input", {}) if parsed else {},
+                        tool_result,
+                    )
+
+                self.agent._append_history(session_id, {"role": "assistant", "text": final_reply})
+                logger.info("ORCHESTRATE - Complete (reuse tool result) at iter %d", iterations)
+                logger.info("=" * 80)
+                result = {"status": "ok", "response": final_reply}
+                if logout_requested:
+                    result["logged_out"] = True
+                return result
+
             if action == "call_tool" and requires_tool and tool_name:
                 (
                     early_response,
@@ -288,6 +327,8 @@ class ConversationOrchestrator:
                 if early_response is not None:
                     return early_response
                 tool_result = new_tool_result
+                last_tool_name = tool_name
+                last_tool_input = tool_input
                 self.agent._append_history(
                     session_id,
                     {"role": "tool", "text": tool_result.data},

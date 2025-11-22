@@ -81,7 +81,10 @@ async def get_account_transactions(account_number: str, limit: int = 20, db=Depe
     stmt = (
         select(Transaction)
         .where(Transaction.account_id == acct.account_id)
-        .order_by(Transaction.created_at.desc())
+        .order_by(
+            Transaction.created_at.desc().nulls_last(),
+            Transaction.transaction_id.desc(),
+        )
         .limit(limit)
     )
     res = await db.execute(stmt)
@@ -155,6 +158,7 @@ async def transfer_funds(payload: TransferIn, db=Depends(get_db)):
             # Compute new balances
             new_balance_from = (Decimal(acct_from.balance) - amount).quantize(Decimal("0.01"))
             new_balance_to = (Decimal(acct_to.balance or 0) + amount).quantize(Decimal("0.01"))
+            now_ts = datetime.utcnow()
 
             # Update balances
             await db.execute(
@@ -185,6 +189,9 @@ async def transfer_funds(payload: TransferIn, db=Depends(get_db)):
                 **({"metadata_json": None} if hasattr(Transaction, "metadata_json") else {"metadata": None}),
                 balance_after=new_balance_from,
                 initiated_by=payload.initiated_by_user_id,
+                created_at=now_ts,
+                updated_at=now_ts,
+                completed_at=now_ts,
             )
             tx_to = Transaction(
                 transaction_id=uuid4(),
@@ -202,6 +209,9 @@ async def transfer_funds(payload: TransferIn, db=Depends(get_db)):
                 **({"metadata_json": None} if hasattr(Transaction, "metadata_json") else {"metadata": None}),
                 balance_after=new_balance_to,
                 initiated_by=payload.initiated_by_user_id,
+                created_at=now_ts,
+                updated_at=now_ts,
+                completed_at=now_ts,
             )
             db.add_all([tx_from, tx_to])
 
