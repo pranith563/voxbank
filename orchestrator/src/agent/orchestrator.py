@@ -96,11 +96,29 @@ class ConversationOrchestrator:
             return otp_pending_result
 
         auth_state = self.agent._get_auth_state(session_id)
-        # If we are currently in a login / registration flow, handle it
-        if auth_state.get("flow_stage"):
-            logger.info("ORCHESTRATE: routing input to auth flow (stage=%s)", auth_state.get("flow_stage"))
-            result = await self.agent._handle_auth_flow(transcript, session_id)
-            logger.info("ORCHESTRATE: auth flow handled with status=%s", result.get("status"))
+        # Normalize any legacy auth stages into the deterministic states
+        if not self.agent.is_authenticated(session_id):
+            legacy_stage = auth_state.get("flow_stage")
+            if legacy_stage in ("await_login_username", "await_choice"):
+                auth_state["flow_stage"] = "await_username"
+            elif legacy_stage in ("await_login_passphrase", "await_register_passphrase"):
+                auth_state["flow_stage"] = "await_passphrase"
+
+        # If we are currently in deterministic login steps, handle without LLM.
+        if (
+            not self.agent.is_authenticated(session_id)
+            and auth_state.get("flow_stage") in ("await_username", "await_passphrase")
+        ):
+            logger.info(
+                "ORCHESTRATE: handling deterministic auth turn stage=%s",
+                auth_state.get("flow_stage"),
+            )
+            result = await self._handle_auth_turn(
+                transcript=transcript,
+                session_id=session_id,
+                session_profile=session_profile,
+            )
+            logger.info("ORCHESTRATE: deterministic auth handled with status=%s", result.get("status"))
             logger.info("=" * 80)
             return result
 
@@ -112,15 +130,12 @@ class ConversationOrchestrator:
             login_keywords = ["login", "log in", "sign in"]
             register_keywords = ["register", "sign up", "create account", "open account"]
             if any(kw in lower_tx for kw in login_keywords + register_keywords):
-                logger.info(
-                    "ORCHESTRATE: detected explicit login/register intent in transcript; "
-                    "routing to auth flow with stage=%s",
-                    auth_state.get("flow_stage") or "await_choice",
-                )
-                result = await self.agent._handle_auth_flow(transcript, session_id)
-                logger.info("ORCHESTRATE: auth flow handled with status=%s", result.get("status"))
-                logger.info("=" * 80)
-                return result
+                logger.info("ORCHESTRATE: detected explicit login/register intent in transcript; starting auth flow")
+                auth_state["flow_stage"] = "await_username"
+                auth_state["temp"]["username"] = None
+                msg = "To access your accounts, please log in. What's your username?"
+                self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
 
         iterations = 0
         parsed: Optional[Dict[str, Any]] = None
@@ -219,8 +234,33 @@ class ConversationOrchestrator:
 
             # Hard guard: unauthenticated sessions must not get account-level answers.
             unauthenticated = not self.agent.is_authenticated(session_id)
-            account_intents = {"balance", "transactions", "transfer"}
-            account_tools = {"balance", "transactions", "transfer"}
+            account_intents = {
+                "balance",
+                "transactions",
+                "transfer",
+                "loans_summary",
+                "cards_summary",
+                "reminders_summary",
+                "loans",
+                "cards",
+                "reminders",
+                "accounts",
+                "profile",
+                "get_my_profile",
+                "get_my_accounts",
+                "get_my_beneficiaries",
+            }
+            account_tools = {
+                "balance",
+                "transactions",
+                "transfer",
+                "loans_summary",
+                "cards_summary",
+                "reminders_summary",
+                "get_my_profile",
+                "get_my_accounts",
+                "get_my_beneficiaries",
+            }
             if (
                 unauthenticated
                 and action == "respond"
@@ -230,9 +270,9 @@ class ConversationOrchestrator:
                 )
             ):
                 state = self.agent._get_auth_state(session_id)
-                if not state.get("flow_stage"):
-                    state["flow_stage"] = "await_choice"
-                login_msg = "You're not logged in yet. Please login or register before I can access your accounts."
+                state["flow_stage"] = "await_username"
+                state["temp"]["username"] = None
+                login_msg = "You're not logged in yet. Please provide your username to continue."
                 self.agent._append_history(session_id, {"role": "assistant", "text": login_msg})
                 logger.info(
                     "ORCHESTRATE - Blocked unauthenticated account-level respond action for session %s (intent=%s, tool=%s)",
@@ -435,6 +475,65 @@ class ConversationOrchestrator:
             or intent_norm in logout_intents
         )
 
+    async def _handle_auth_turn(
+        self,
+        *,
+        transcript: str,
+        session_id: str,
+        session_profile: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Deterministic auth mini-state-machine for username/passphrase capture.
+        """
+        text = (transcript or "").strip()
+        lower = text.lower()
+        state = self.agent._get_auth_state(session_id)
+
+        if any(kw in lower for kw in ("cancel login", "cancel sign in", "stop login", "nevermind login")):
+            state["flow_stage"] = "idle"
+            state["temp"]["username"] = None
+            msg = "Login cancelled. How else can I help you?"
+            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "ok", "response": msg}
+
+        if state.get("flow_stage") == "await_username":
+            username = text
+            state["temp"]["username"] = username
+            state["flow_stage"] = "await_passphrase"
+            msg = f"Thanks, {username}. Please provide your passphrase to log in."
+            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "clarify", "message": msg}
+
+        if state.get("flow_stage") == "await_passphrase":
+            username = (state.get("temp") or {}).get("username")
+            if not username:
+                state["flow_stage"] = "await_username"
+                msg = "Please provide your username to continue logging in."
+                self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            login_res = await self.agent._login_user_via_http(username, text)
+            if not login_res:
+                msg = "That passphrase didn't match our records. Please try again, or say 'cancel login'."
+                self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+                return {"status": "clarify", "message": msg}
+
+            user_id = login_res.get("user_id") or username
+            state["authenticated"] = True
+            state["user_id"] = user_id
+            state["flow_stage"] = "idle"
+            state["temp"] = {}
+
+            if session_profile is not None:
+                session_profile["is_authenticated"] = True
+                session_profile["user_id"] = user_id
+
+            msg = f"You're now logged in as {username}. How can I help you with your accounts?"
+            self.agent._append_history(session_id, {"role": "assistant", "text": msg})
+            return {"status": "ok", "response": msg, "authenticated_user_id": user_id}
+
+        return {"status": "clarify", "message": "Please say 'login' to start authentication."}
+
     async def _handle_call_tool(
         self,
         *,
@@ -609,9 +708,9 @@ class ConversationOrchestrator:
                 tool_name,
             )
             state = self.agent._get_auth_state(session_id)
-            if not state.get("flow_stage"):
-                state["flow_stage"] = "await_choice"
-            msg = "You're not logged in yet. Would you like to login or register?"
+            state["flow_stage"] = "await_username"
+            state["temp"]["username"] = None
+            msg = "You're not logged in yet. Please provide your username to continue."
             self.agent._append_history(session_id, {"role": "assistant", "text": msg})
             logger.info(
                 "ORCHESTRATE - Completed (auth_required before tool exec) at iter %d",

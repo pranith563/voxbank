@@ -150,7 +150,7 @@ class VoxBankAgent:
             self.auth_state[session_id] = {
                 "authenticated": False,
                 "user_id": None,
-                "flow_stage": None,
+                "flow_stage": "idle",
                 "temp": {},
             }
         return self.auth_state[session_id]
